@@ -1,0 +1,122 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"). You
+# may not use this file except in compliance with the License. A copy of
+# the License is located at
+#
+#     http://aws.amazon.com/apache2.0/
+#
+# or in the "license" file accompanying this file. This file is
+# distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
+# ANY KIND, either express or implied. See the License for the specific
+# language governing permissions and limitations under the License.
+
+# Ray head on a dedicated CPU instance for RayCPUNodeConfig (see docs/ray_cpu_dataloader.md).
+#
+# The head advertises the custom resource "hpct_cpu_dataloader" (CPU_DATALOADER_RESOURCE), so the
+# PrefetchActors (one per job/split/dp_rank) are scheduled here and run the real dataloader, while
+# GPU nodes only consume batches.
+#
+# Use the same image as the training job so the dataloader factory (examples/dataloader/
+# ray_cpu_dataloader_factory.py) is importable here, and mount the same dataset storage.
+#
+# GPU pods join the cluster before launching training, so each GPU node has a local raylet and
+# object store (batches are pulled once per GPU node). In the training job's container args
+# (e.g. pretrain_llama3_70b_checkpointless_p5.yaml), before hyperpodrun/torchrun:
+#
+#   ray start --address=hpct-ray-cpu-dataloader-head:6379 --num-cpus=0 --block & \
+#   until ray status --address=hpct-ray-cpu-dataloader-head:6379 >/dev/null 2>&1; do sleep 1; done && \
+#   hyperpodrun ...
+#
+# and keep RayCPUNodeConfig(ray_address="auto") (the default) so training processes attach to the
+# local raylet. Ray connects pods directly by pod IP for object transfer; the Service below is only
+# used for head discovery (6379), the dashboard (8265) and Ray Client (10001). Make sure network
+# policies allow pod-to-pod traffic between the GPU pods and this pod on Ray's ports.
+#
+# Ray version (ray[default]>=2.40,<3) and Python version must match between the head and GPU pods.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hpct-ray-cpu-dataloader-head
+  labels:
+    app.kubernetes.io/name: hpct-ray-cpu-dataloader-head
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hpct-ray-cpu-dataloader-head
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hpct-ray-cpu-dataloader-head
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: ml.c5.18xlarge  # placeholder: any CPU instance type
+      containers:
+        - name: ray-head
+          image: ""  # same image as the training job
+          imagePullPolicy: Always
+          ports:
+            - name: gcs
+              containerPort: 6379
+            - name: dashboard
+              containerPort: 8265
+            - name: client
+              containerPort: 10001
+          env:
+            - name: RAY_NUM_CPUS
+              value: "70"  # leave a few of the instance's vCPUs for the raylet/OS
+          command: ["/bin/sh"]
+          args:
+            - "-c"
+            - |
+              ray start --head \
+                --port=6379 \
+                --dashboard-host=0.0.0.0 \
+                --ray-client-server-port=10001 \
+                --num-cpus="${RAY_NUM_CPUS}" \
+                --resources='{"hpct_cpu_dataloader": 1000}' \
+                --block
+          resources:
+            requests:
+              cpu: "64"
+              memory: 128Gi
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "ray status --address=127.0.0.1:6379"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: persistent-storage
+              mountPath: /data
+            - name: dshm  # Ray object store (Plasma) lives in /dev/shm
+              mountPath: /dev/shm
+      volumes:
+        - name: persistent-storage
+          persistentVolumeClaim:
+            claimName: fsx-claim
+        - name: dshm
+          emptyDir:
+            medium: Memory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hpct-ray-cpu-dataloader-head
+  labels:
+    app.kubernetes.io/name: hpct-ray-cpu-dataloader-head
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hpct-ray-cpu-dataloader-head
+  ports:
+    - name: gcs
+      port: 6379
+      targetPort: 6379
+    - name: dashboard
+      port: 8265
+      targetPort: 8265
+    - name: client
+      port: 10001
+      targetPort: 10001

@@ -21,6 +21,9 @@ dependencies = [
     "pip<25.3", # pip 25.3 introduced backwards incompatible changes
 ]
 
+[project.optional-dependencies]
+ray = ["ray[default]>=2.40,<3"]
+
 # https://hatch.pypa.io/latest/version/
 [tool.hatch.version]
 source = "code"
@@ -74,6 +77,7 @@ dependencies = [
     "sentencepiece==0.2.0",
     "psutil>=6.0.0",
     "numpy<2.3.0",
+    "ray[default]>=2.40,<3",
     "build",
     "pip<25.3", # pip 25.3 introduced backwards incompatible changes
 ]
