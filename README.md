@@ -52,6 +52,80 @@ kubectl logs <pod-name>
 
 For detailed installation steps, environment setup, and configuration options, see the tutorials at [Amazon SageMaker HyperPod Checkpointless training](https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-eks-checkpointless.html).
 
+## Dedicated CPU-node dataloading with Ray
+
+By default every GPU node runs a prefetching dataloader (`CacheResumeMMAPConfig`) that iterates the dataset on the GPU host and caches batches in `/dev/shm`. `RayCPUNodeConfig` moves dataset iteration to a dedicated CPU instance instead:
+
+- A Ray head on the CPU node runs one detached `PrefetchActor` per (job, split, DP rank). Each actor builds the real dataloader (with its CPU workers), stores batches in the Ray object store and keeps a window of recent and upcoming steps.
+- Every GPU rank reads its DP replica's batches through a `RayReadDataLoader`, which prefetches a few steps ahead. Ranks on the same GPU node share one local copy of each batch.
+- Restarts need no collective: the window lives on the CPU node, so ranks just re-register at the resumed step.
+
+See [docs/ray_cpu_dataloader.md](docs/ray_cpu_dataloader.md) for the design and interface contract.
+
+### Install
+
+```bash
+pip install .[ray]   # ray[default]>=2.40,<3
+```
+
+### Cluster setup
+
+1. Deploy the Ray head on a CPU instance: [examples/llama3/launch/ray_cpu_dataloader_head.yaml](examples/llama3/launch/ray_cpu_dataloader_head.yaml) (set the image to your training image and the `nodeSelector` to your CPU instance type). It runs `ray start --head ... --resources='{"hpct_cpu_dataloader": 1000}'` and exposes it through the `hpct-ray-cpu-dataloader-head` Service.
+2. In the training job, join each GPU pod to the Ray cluster before launching training:
+
+   ```bash
+   ray start --address=hpct-ray-cpu-dataloader-head:6379 --num-cpus=0 --block &
+   # wait for the raylet, then: hyperpodrun ... / torchrun ...
+   ```
+
+   Training processes connect with `ray_address="auto"` (the default).
+
+### Configuration
+
+Replace `CacheResumeMMAPConfig` with `RayCPUNodeConfig` and pass a picklable dataloader factory that runs on the CPU node. For example, in `examples/llama3/llama3_70b_pretrain_checkpointless.py`:
+
+```python
+# from hyperpod_checkpointless_training.dataloader.config import CacheResumeMMAPConfig
+from hyperpod_checkpointless_training.dataloader.config import RayCPUNodeConfig
+from examples.dataloader.ray_cpu_dataloader_factory import HFDatasetCPUDataLoaderFactory
+
+        return CheckpointlessDataModule(
+            cfg=self.cfg,
+            data_module=MMAPDataModule(
+                data_module=base_data_module,
+                # mmap_config=CacheResumeMMAPConfig(
+                #     cache_dir=self.cfg.mmap.cache_dir, checkpoint_frequency=self.cfg.mmap.checkpoint_frequency
+                # ),
+                mmap_config=RayCPUNodeConfig(
+                    cpu_dataloader_factory=HFDatasetCPUDataLoaderFactory(
+                        dataset_path=self.cfg.dataset.dataset_path,
+                        val_dataset_path=self.cfg.dataset.get("val_dataset_path", None),
+                        seq_length=self.cfg.data.seq_length,
+                        micro_batch_size=self.cfg.data.micro_batch_size,
+                        num_workers=self.cfg.dataset.get("num_workers", 4),
+                        shuffle=self.cfg.dataset.get("shuffle", False),
+                        drop_last=self.cfg.dataset.get("drop_last", True),
+                        keep_in_memory=self.cfg.dataset.get("keep_in_memory", False),
+                    ),
+                    job_name=os.environ["JOB_NAME"],  # unique per job: actor names are derived from it
+                ),
+            ),
+        )
+```
+
+Other options: `prefetch_length` / `val_prefetch_length` (steps produced and fetched ahead), `lookback_length` (already-consumed steps kept for rollback on restart), `actor_num_cpus`, `actor_resources` (defaults to the `hpct_cpu_dataloader` resource), `ray_namespace`, and `enable_batch_encryption`.
+
+### Fault and resume behaviour
+
+- **GPU fault, CPU node alive (warm start)**: on in-process restart the ranks re-register at the resumed step. If that step is still in the actor's window (within `lookback_length` behind the slowest consumer, or already prefetched), reading continues immediately from the cached batches.
+- **Resume step outside the window**: the actor drops its window and rebuilds the dataloader at the resumed step (cold start).
+- **CPU node or actor loss (cold start)**: in-flight reads fail with a Ray error, which triggers a restart; on restart a new actor is created and rebuilds the dataloader at the resumed step. This relies on the dataloader factory being seekable via `target_load_step`.
+
+### Current limitations
+
+- The CPU node is a single failure domain: losing it loses all prefetched batches and forces a cold start for every DP replica.
+- No replicated producers or persisted window yet; the CPU tier itself cannot warm start.
+
 ## Recommended Requirements
 
 | Component | Version |
