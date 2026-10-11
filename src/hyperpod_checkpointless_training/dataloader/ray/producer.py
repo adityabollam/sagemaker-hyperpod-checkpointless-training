@@ -155,10 +155,12 @@ class PrefetchActor:
 
     def get_ref(self, step: int) -> tuple[str, list]:
         with self._lock:
+            status, ref = self._window.lookup(step)
+            if status == "ready":
+                return "ready", [ref]
             if self._error is not None and self._error[0] == self._generation:
                 return "error", [self._error[1]]
-            status, ref = self._window.lookup(step)
-            return ("ready", [ref]) if status == "ready" else (status, [])
+            return status, []
 
     def ack(self, consumer_id: int, next_step: int) -> None:
         with self._lock:

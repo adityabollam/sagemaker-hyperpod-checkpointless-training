@@ -192,7 +192,7 @@ class PrefetchActor:
     def get_ref(self, step: int) -> tuple[str, list]:
         # status from window.lookup(step); refs wrapped in a list so Ray returns the ObjectRef itself
         # ("ready", [ref]) / ("pending", []) / ("final", []) / ("evicted", []) / ("error", [traceback_str])
-        # "error" takes precedence when the producer thread hit an exception for this generation.
+        # "error" takes precedence over pending/final/evicted, but already-produced ready steps are still served.
 
     def ack(self, consumer_id: int, next_step: int) -> None   # window.ack(...); drop evicted refs (del)
     def length(self) -> int | None

@@ -349,6 +349,21 @@ def test_iterator_exception_is_reported_and_reseek_clears_error(actor_factory):
     assert wait_until(lambda: actor.get_ref(0)[0] == "ready")
 
 
+def test_produced_steps_stay_ready_after_iterator_exception(actor_factory):
+    actor = actor_factory(StepFactory(5, fail_at=3), prefetch_length=4)
+    actor.register(0, 0)
+
+    assert wait_until(lambda: actor.get_ref(3)[0] == "error")
+    for step in range(3):
+        status, payload = actor.get_ref(step)
+        assert status == "ready"
+        assert torch.equal(payload[0]["tokens"], torch.full((2, 4), step))
+
+    status, payload = actor.get_ref(3)
+    assert status == "error"
+    assert "failure at step 3" in payload[0]
+
+
 def test_encryption_manager_is_lazy_and_encrypts_once(actor_factory, monkeypatch):
     class FakeEncryptionManager:
         instances = 0
