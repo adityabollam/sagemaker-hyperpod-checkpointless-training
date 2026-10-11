@@ -49,6 +49,8 @@ class StubPrefetchActor:
         error_step=None,
         payload_fn=None,
         get_ref_delay_s=0.0,
+        register_delay_s=0.0,
+        length_delay_s=0.0,
     ):
         self.final_step = final_step
         self._length = length
@@ -57,12 +59,16 @@ class StubPrefetchActor:
         self.error_step = error_step
         self.payload_fn = payload_fn or (lambda s: {"step": s})
         self.get_ref_delay_s = get_ref_delay_s
+        self.register_delay_s = register_delay_s
+        self.length_delay_s = length_delay_s
         self.refs = {}
         self.polls = 0
         self.registrations = []
         self.acks = []
 
     def register(self, consumer_id, step, reseek_token=None):
+        if self.register_delay_s:
+            time.sleep(self.register_delay_s)
         self.registrations.append((consumer_id, step, reseek_token))
         return {
             "mode": "warm_start" if step else "cold_start",
@@ -90,6 +96,8 @@ class StubPrefetchActor:
         self.acks.append((consumer_id, next_step))
 
     def length(self):
+        if self.length_delay_s:
+            time.sleep(self.length_delay_s)
         return self._length
 
     def get_registrations(self):
@@ -177,6 +185,32 @@ def test_rpc_timeout_is_raised_in_main_thread():
     with pytest.raises(ray.exceptions.GetTimeoutError):
         next(iter(dl))
     assert time.monotonic() - start < 1.5
+
+
+def test_register_timeout_allows_slow_initial_registration():
+    actor = StubPrefetchActor.remote(final_step=3, length=3, register_delay_s=1.5)
+    dl = _make(actor, rpc_timeout_s=0.5, register_timeout_s=10.0)
+
+    assert [batch["step"] for batch in dl] == [0, 1, 2]
+
+
+def test_register_timeout_is_applied_to_initial_registration():
+    actor = StubPrefetchActor.remote(final_step=3, length=3, register_delay_s=1.5)
+
+    with pytest.raises(ray.exceptions.GetTimeoutError):
+        _make(actor, rpc_timeout_s=0.5, register_timeout_s=0.3)
+
+
+def test_val_length_uses_register_timeout():
+    actor = StubPrefetchActor.remote(length=3, length_delay_s=1.5)
+    dl = _make(
+        actor,
+        is_val=True,
+        rpc_timeout_s=0.5,
+        register_timeout_s=10.0,
+    )
+
+    assert dl.remote_length() == 3
 
 
 def test_stop_from_other_thread_while_blocked_on_pending():

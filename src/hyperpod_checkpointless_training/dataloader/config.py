@@ -175,6 +175,7 @@ class RayCPUNodeConfig(MMAPConfig):
     actor_num_cpus: float = 1.0
     actor_resources: dict | None = None
     enable_batch_encryption: bool = False
+    register_timeout_s: float = 900.0
 
     def create(
         self,
@@ -261,6 +262,7 @@ class RayCPUNodeConfig(MMAPConfig):
             prefetch_length=prefetch_length,
             is_val=is_val,
             enable_batch_encryption=self.enable_batch_encryption,
+            register_timeout_s=self.register_timeout_s,
         )
 
         data_loader.set_length(max(cached_len, data_loader.remote_length() or 0))

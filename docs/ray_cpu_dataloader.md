@@ -245,7 +245,8 @@ class RayReadDataLoader:
         is_val: bool = False,
         enable_batch_encryption: bool = False,
         poll_interval_s: float = 0.05,
-        rpc_timeout_s: float = 60.0,
+        rpc_timeout_s: float = 60.0,  # Timeout for every other ray.get.
+        register_timeout_s: float = 900.0,  # ray.get timeout for register/length (first register builds the dataloader)
     ): ...
         # train (is_val=False): calls actor.register(consumer_id, step, None) here and stores the
         #   response as self.restart_info (mode/length/snapshot) – mirrors CacheResume* doing init in __init__.
@@ -293,6 +294,7 @@ class RayCPUNodeConfig(MMAPConfig):
     actor_num_cpus: float = 1.0
     actor_resources: dict | None = None       # None -> {CPU_DATALOADER_RESOURCE: 0.001}
     enable_batch_encryption: bool = False
+    register_timeout_s: float = 900.0
 
     def create(self, dataloader_init_callable, parallel_state_util, step, is_data_loading_rank,
                create_model_parallel_group_callable, name="Train", is_val=False, cached_len=0):
@@ -307,7 +309,8 @@ class RayCPUNodeConfig(MMAPConfig):
         #    dp_size = ps.get_data_parallel_world_size()
         # 5. actor = get_or_create_prefetch_actor(job_name, split="val" if is_val else "train", ...)
         # 6. dl = RayReadDataLoader(step, actor, consumer_id=dist.get_rank(),
-        #        prefetch_length=val_prefetch_length if is_val else prefetch_length, is_val=is_val, ...)
+        #        prefetch_length=val_prefetch_length if is_val else prefetch_length, is_val=is_val,
+        #        register_timeout_s=register_timeout_s, ...)
         # 7. dl.set_length(max(cached_len, dl.remote_length() or 0)); log like the existing config; return dl
 ```
 

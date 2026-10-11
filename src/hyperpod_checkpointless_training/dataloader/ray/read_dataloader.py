@@ -79,6 +79,7 @@ class RayReadDataLoader:
         enable_batch_encryption: bool = False,
         poll_interval_s: float = 0.05,
         rpc_timeout_s: float = 60.0,
+        register_timeout_s: float = 900.0,
     ):
         """Initialize the Ray Read Data Loader.
 
@@ -91,7 +92,9 @@ class RayReadDataLoader:
             enable_batch_encryption: Whether batches are KMS-encrypted by the producer.
                 If enabled, assumes AWS_KMS_KEY_ID is set in the environment.
             poll_interval_s: Sleep between ``get_ref`` polls while a step is pending.
-            rpc_timeout_s: Timeout for every ``ray.get``.
+            rpc_timeout_s: Timeout for every other ``ray.get``.
+            register_timeout_s: Timeout for the register and length RPCs; the first register (and a
+                val length()) builds the dataloader on the CPU node, which can take minutes.
         """
         self._logger = get_logger(__name__)
         self._actor = actor
@@ -101,6 +104,7 @@ class RayReadDataLoader:
         self._enable_batch_encryption = enable_batch_encryption
         self._poll_interval_s = poll_interval_s
         self._rpc_timeout_s = rpc_timeout_s
+        self._register_timeout_s = register_timeout_s
 
         self._step = 0 if is_val else step
         self._length = None
@@ -136,12 +140,12 @@ class RayReadDataLoader:
         """Length reported by the producer actor (``len`` of the CPU-node dataloader)."""
         if not self._is_val and self.restart_info is not None:
             return self.restart_info.get("length")
-        return ray.get(self._actor.length.remote(), timeout=self._rpc_timeout_s)
+        return ray.get(self._actor.length.remote(), timeout=self._register_timeout_s)
 
     def _register(self, step: int, reseek_token: str | None) -> dict:
         info = ray.get(
             self._actor.register.remote(self._consumer_id, step, reseek_token),
-            timeout=self._rpc_timeout_s,
+            timeout=self._register_timeout_s,
         )
         self._logger.info(
             f"[{self._consumer_id}] Registered with prefetch actor at step={step} "

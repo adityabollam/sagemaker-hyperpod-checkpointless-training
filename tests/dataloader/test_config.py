@@ -574,6 +574,7 @@ class TestRayCPUNodeConfig(unittest.TestCase):
         self.assertEqual(config.actor_num_cpus, 1.0)
         self.assertIsNone(config.actor_resources)
         self.assertFalse(config.enable_batch_encryption)
+        self.assertEqual(config.register_timeout_s, 900.0)
 
     def test_config_module_has_no_top_level_ray_import(self):
         tree = ast.parse(inspect.getsource(config_module))
@@ -638,6 +639,7 @@ class TestRayCPUNodeConfig(unittest.TestCase):
             prefetch_length=7,
             is_val=False,
             enable_batch_encryption=False,
+            register_timeout_s=900.0,
         )
         self.read_dl.set_length.assert_called_once_with(100)
         mock_all_reduce.assert_not_called()
@@ -650,6 +652,7 @@ class TestRayCPUNodeConfig(unittest.TestCase):
             cpu_dataloader_factory=self.factory,
             actor_resources={"custom": 1},
             enable_batch_encryption=True,
+            register_timeout_s=5.0,
         )
         self._create(config=config)
 
@@ -659,6 +662,7 @@ class TestRayCPUNodeConfig(unittest.TestCase):
         self.assertEqual(actor_kwargs["job_name"], "default")
         self.assertEqual(actor_kwargs["namespace"], "hyperpod_checkpointless")
         self.assertTrue(self.fake_read_dataloader.RayReadDataLoader.call_args.kwargs["enable_batch_encryption"])
+        self.assertEqual(self.fake_read_dataloader.RayReadDataLoader.call_args.kwargs["register_timeout_s"], 5.0)
         self.fake_ray.init.assert_called_once_with(
             address="auto", namespace="hyperpod_checkpointless", ignore_reinit_error=True
         )
@@ -682,6 +686,7 @@ class TestRayCPUNodeConfig(unittest.TestCase):
             prefetch_length=3,
             is_val=True,
             enable_batch_encryption=False,
+            register_timeout_s=900.0,
         )
         mock_all_reduce.assert_not_called()
 
