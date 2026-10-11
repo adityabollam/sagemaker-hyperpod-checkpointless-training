@@ -13,15 +13,21 @@
 
 # type: ignore
 """Unit tests for config.py module."""
+import ast
+import inspect
 import os
+import sys
+import types
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
+from hyperpod_checkpointless_training.dataloader import config as config_module
 from hyperpod_checkpointless_training.dataloader.config import (
     MMAPConfig,
     CacheResumeMMAPConfig,
+    RayCPUNodeConfig,
 )
 
 
@@ -395,7 +401,7 @@ class TestCacheResumeMMAPConfigWithLengthSetting(unittest.TestCase):
         mock_num_mbs.return_value = 1
 
         # Call with cached_len provided
-        result = self.config.create(
+        self.config.create(
             mock_dataloader_callable,
             mock_parallel_state_util,
             100,
@@ -444,7 +450,7 @@ class TestCacheResumeMMAPConfigWithLengthSetting(unittest.TestCase):
         mock_num_mbs.return_value = 1
 
         # Call with cached_len=150 - no synchronization should occur
-        result = self.config.create(
+        self.config.create(
             mock_dataloader_callable,
             mock_parallel_state_util,
             100,
@@ -478,3 +484,229 @@ class TestCacheResumeMMAPConfigWithLengthSetting(unittest.TestCase):
             )
 
         self.assertIn("step must be provided", str(context.exception))
+
+
+RAY_PKG = "hyperpod_checkpointless_training.dataloader.ray"
+RAY_PRODUCER = f"{RAY_PKG}.producer"
+RAY_READ_DATALOADER = f"{RAY_PKG}.read_dataloader"
+
+
+class TestRayCPUNodeConfig(unittest.TestCase):
+    """Test cases for RayCPUNodeConfig with ray and the ray dataloader modules faked."""
+
+    def setUp(self):
+        self.factory = Mock(name="cpu_dataloader_factory")
+        self.config = RayCPUNodeConfig(
+            cpu_dataloader_factory=self.factory,
+            job_name="job",
+            ray_address="ray://head:10001",
+            ray_namespace="ns",
+            prefetch_length=7,
+            val_prefetch_length=3,
+            lookback_length=4,
+            actor_num_cpus=2.0,
+        )
+
+        self.fake_ray = types.ModuleType("ray")
+        self.fake_ray.is_initialized = Mock(return_value=False)
+        self.fake_ray.init = Mock()
+
+        self.actor = Mock(name="actor")
+        self.fake_producer = types.ModuleType(RAY_PRODUCER)
+        self.fake_producer.CPU_DATALOADER_RESOURCE = "hpct_cpu_dataloader"
+        self.fake_producer.get_or_create_prefetch_actor = Mock(return_value=self.actor)
+
+        self.read_dl = MagicMock(name="read_dl")
+        self.read_dl.remote_length.return_value = 100
+        self.read_dl.__len__.return_value = 100
+        self.fake_read_dataloader = types.ModuleType(RAY_READ_DATALOADER)
+        self.fake_read_dataloader.RayReadDataLoader = Mock(return_value=self.read_dl)
+
+        fake_pkg = types.ModuleType(RAY_PKG)
+        fake_pkg.__path__ = []
+        fake_pkg.producer = self.fake_producer
+        fake_pkg.read_dataloader = self.fake_read_dataloader
+
+        self.parallel_state_util = Mock()
+        self.parallel_state_util.parallel_state.get_data_parallel_rank.return_value = 3
+        self.parallel_state_util.parallel_state.get_data_parallel_world_size.return_value = 8
+
+        self.dataloader_init = Mock()
+        self.is_data_loading_rank = Mock()
+        self.create_model_parallel_group = Mock()
+
+        patchers = [
+            patch.dict(
+                sys.modules,
+                {
+                    "ray": self.fake_ray,
+                    RAY_PKG: fake_pkg,
+                    RAY_PRODUCER: self.fake_producer,
+                    RAY_READ_DATALOADER: self.fake_read_dataloader,
+                },
+            ),
+            patch("torch.distributed.get_rank", return_value=11),
+        ]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _create(self, config=None, step=100, **kwargs):
+        return (config or self.config).create(
+            self.dataloader_init,
+            self.parallel_state_util,
+            step,
+            self.is_data_loading_rank,
+            self.create_model_parallel_group,
+            **kwargs,
+        )
+
+    def test_defaults(self):
+        config = RayCPUNodeConfig()
+        self.assertIsInstance(config, MMAPConfig)
+        self.assertIsNone(config.cpu_dataloader_factory)
+        self.assertEqual(config.job_name, "default")
+        self.assertEqual(config.ray_address, "auto")
+        self.assertEqual(config.ray_namespace, "hyperpod_checkpointless")
+        self.assertEqual(config.prefetch_length, 10)
+        self.assertEqual(config.val_prefetch_length, 10)
+        self.assertEqual(config.lookback_length, 2)
+        self.assertEqual(config.actor_num_cpus, 1.0)
+        self.assertIsNone(config.actor_resources)
+        self.assertFalse(config.enable_batch_encryption)
+
+    def test_config_module_has_no_top_level_ray_import(self):
+        tree = ast.parse(inspect.getsource(config_module))
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            else:
+                continue
+            for name in names:
+                self.assertFalse(name == "ray" or name.startswith("ray."), name)
+                self.assertFalse(name.startswith(RAY_PKG), name)
+
+    def test_create_step_none_raises(self):
+        with self.assertRaises(ValueError) as context:
+            self._create(step=None)
+        self.assertIn("step must be provided", str(context.exception))
+        self.fake_ray.init.assert_not_called()
+        self.fake_producer.get_or_create_prefetch_actor.assert_not_called()
+
+    def test_create_missing_factory_raises(self):
+        with self.assertRaises(ValueError) as context:
+            self._create(config=RayCPUNodeConfig())
+        self.assertIn("cpu_dataloader_factory", str(context.exception))
+        self.fake_ray.init.assert_not_called()
+        self.fake_producer.get_or_create_prefetch_actor.assert_not_called()
+
+    def test_create_inits_ray_when_not_initialized(self):
+        self._create()
+        self.fake_ray.init.assert_called_once_with(
+            address="ray://head:10001", namespace="ns", ignore_reinit_error=True
+        )
+
+    def test_create_skips_ray_init_when_initialized(self):
+        self.fake_ray.is_initialized.return_value = True
+        self._create()
+        self.fake_ray.init.assert_not_called()
+
+    @patch("torch.distributed.all_reduce")
+    def test_create_train(self, mock_all_reduce):
+        result = self._create(step=100)
+
+        self.assertIs(result, self.read_dl)
+        self.fake_producer.get_or_create_prefetch_actor.assert_called_once_with(
+            job_name="job",
+            split="train",
+            dp_rank=3,
+            dp_size=8,
+            dataloader_factory=self.factory,
+            lookback_length=4,
+            prefetch_length=7,
+            namespace="ns",
+            num_cpus=2.0,
+            resources=None,
+            enable_batch_encryption=False,
+        )
+        self.fake_read_dataloader.RayReadDataLoader.assert_called_once_with(
+            100,
+            self.actor,
+            consumer_id=11,
+            prefetch_length=7,
+            is_val=False,
+            enable_batch_encryption=False,
+        )
+        self.read_dl.set_length.assert_called_once_with(100)
+        mock_all_reduce.assert_not_called()
+        self.dataloader_init.assert_not_called()
+        self.is_data_loading_rank.assert_not_called()
+        self.create_model_parallel_group.assert_not_called()
+
+    def test_create_passes_resources_and_encryption(self):
+        config = RayCPUNodeConfig(
+            cpu_dataloader_factory=self.factory,
+            actor_resources={"custom": 1},
+            enable_batch_encryption=True,
+        )
+        self._create(config=config)
+
+        actor_kwargs = self.fake_producer.get_or_create_prefetch_actor.call_args.kwargs
+        self.assertEqual(actor_kwargs["resources"], {"custom": 1})
+        self.assertTrue(actor_kwargs["enable_batch_encryption"])
+        self.assertEqual(actor_kwargs["job_name"], "default")
+        self.assertEqual(actor_kwargs["namespace"], "hyperpod_checkpointless")
+        self.assertTrue(self.fake_read_dataloader.RayReadDataLoader.call_args.kwargs["enable_batch_encryption"])
+        self.fake_ray.init.assert_called_once_with(
+            address="auto", namespace="hyperpod_checkpointless", ignore_reinit_error=True
+        )
+
+    def test_create_unknown_remote_length_sets_zero(self):
+        self.read_dl.remote_length.return_value = None
+        self._create()
+        self.read_dl.set_length.assert_called_once_with(0)
+
+    @patch("torch.distributed.all_reduce")
+    def test_create_val(self, mock_all_reduce):
+        self._create(step=100, name="Val", is_val=True)
+
+        actor_kwargs = self.fake_producer.get_or_create_prefetch_actor.call_args.kwargs
+        self.assertEqual(actor_kwargs["split"], "val")
+        self.assertEqual(actor_kwargs["prefetch_length"], 3)
+        self.fake_read_dataloader.RayReadDataLoader.assert_called_once_with(
+            0,
+            self.actor,
+            consumer_id=11,
+            prefetch_length=3,
+            is_val=True,
+            enable_batch_encryption=False,
+        )
+        mock_all_reduce.assert_not_called()
+
+    @patch("hyperpod_checkpointless_training.dataloader.config.get_num_microbatches", return_value=1)
+    def test_create_cached_len_adjusts_for_epoch_resume(self, mock_num_mbs):
+        self.read_dl.remote_length.return_value = 40
+        self._create(step=100, cached_len=150)
+
+        # batch_in_epoch = 100 % 150 = 100, remaining = 50
+        self.assertEqual(self.fake_read_dataloader.RayReadDataLoader.call_args.args[0], 100)
+        self.read_dl.set_length.assert_called_once_with(50)
+
+    @patch("hyperpod_checkpointless_training.dataloader.config.get_num_microbatches", return_value=2)
+    def test_create_cached_len_after_epoch_uses_max_with_remote_length(self, mock_num_mbs):
+        self.read_dl.remote_length.return_value = 200
+        self._create(step=100, cached_len=150)
+
+        # batch_in_epoch = (100 * 2) % 150 = 50, remaining = 100 < remote_length 200
+        self.assertEqual(self.fake_read_dataloader.RayReadDataLoader.call_args.args[0], 50)
+        self.read_dl.set_length.assert_called_once_with(200)
+
+    def test_adjust_for_epoch_resume_shared_with_cache_resume_config(self):
+        self.assertIs(
+            RayCPUNodeConfig._adjust_for_epoch_resume, MMAPConfig._adjust_for_epoch_resume
+        )
+        self.assertIs(
+            CacheResumeMMAPConfig._adjust_for_epoch_resume, MMAPConfig._adjust_for_epoch_resume
+        )
