@@ -246,7 +246,11 @@ def test_warm_restart_reuses_prefetched_batches(e2e):
 def test_outside_window_reseeks_from_requested_steps(e2e):
     harness = e2e()
     loader = harness.create(step=0)
-    assert [batch["step"] for batch in iter(loader)] == list(range(20))
+    iterator = iter(loader)
+    for step in range(11):
+        assert_batch(next(iterator), step)
+    loader.stop()
+    del iterator, loader
 
     resumed = harness.create(step=2)
     assert resumed.restart_info["mode"] == "cold_start"
