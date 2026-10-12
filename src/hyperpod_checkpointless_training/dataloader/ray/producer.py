@@ -84,7 +84,9 @@ class PrefetchActor:
     ) -> dict:
         with self._lock:
             reason = None
-            if self._window.producer_step is None:
+            if self._error is not None and self._error[0] == self._generation:
+                reason = "producer_error"
+            elif self._window.producer_step is None:
                 reason = "uninitialized"
             elif not self._window.can_resume_from(step):
                 reason = "outside_window"

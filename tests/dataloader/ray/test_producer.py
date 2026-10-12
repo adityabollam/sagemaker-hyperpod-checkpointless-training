@@ -75,6 +75,29 @@ class StepFactory:
         return StepDataLoader(self.n, target_load_step, self.fail_at)
 
 
+class FailOnceAtStepFactory:
+    def __init__(self, n, fail_at):
+        self.n = n
+        self.fail_at = fail_at
+        self.failed = False
+
+    def __call__(self, *, dp_rank, dp_size, target_load_step, is_val):
+        factory = self
+
+        class FailOnceDataLoader:
+            def __len__(self):
+                return factory.n
+
+            def __iter__(self):
+                for step in range(target_load_step, factory.n):
+                    if step == factory.fail_at and not factory.failed:
+                        factory.failed = True
+                        raise RuntimeError(f"failure at step {step}")
+                    yield {"tokens": torch.full((2, 4), step)}
+
+        return FailOnceDataLoader()
+
+
 class NoLengthFactory:
     def __init__(self):
         self.calls = []
@@ -347,6 +370,24 @@ def test_iterator_exception_is_reported_and_reseek_clears_error(actor_factory):
 
     assert result["mode"] == "cold_start"
     assert wait_until(lambda: actor.get_ref(0)[0] == "ready")
+
+
+def test_register_reseeks_after_current_generation_producer_error(actor_factory):
+    factory = FailOnceAtStepFactory(8, fail_at=4)
+    actor = actor_factory(factory, prefetch_length=5)
+    assert actor.register(0, 3)["mode"] == "cold_start"
+
+    assert wait_until(lambda: actor.get_ref(4)[0] == "error")
+    assert actor.get_ref(3)[0] == "ready"
+
+    result = actor.register(0, 3)
+
+    assert result["mode"] == "cold_start"
+    for step in range(3, 7):
+        assert wait_until(lambda step=step: actor.get_ref(step)[0] == "ready")
+        status, payload = actor.get_ref(step)
+        assert status == "ready"
+        assert torch.equal(payload[0]["tokens"], torch.full((2, 4), step))
 
 
 def test_produced_steps_stay_ready_after_iterator_exception(actor_factory):
