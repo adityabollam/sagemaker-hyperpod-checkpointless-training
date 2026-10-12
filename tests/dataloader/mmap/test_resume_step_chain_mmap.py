@@ -143,13 +143,22 @@ def resume_to_step(module, step):
 def test_mmap_resume_step_chain(k, tmp_path, monkeypatch):
     if dist.is_initialized():
         pytest.skip("torch.distributed already initialized")
-    dist.init_process_group(
-        "gloo", init_method=f"file://{tmp_path}/pg", rank=0, world_size=1
-    )
-    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
+    original_get_context = torch.multiprocessing.get_context
+    spawn_context = original_get_context("spawn")
+
+    def get_context(method=None):
+        if method == "fork":
+            return spawn_context
+        return original_get_context(method)
+
+    monkeypatch.setattr(torch.multiprocessing, "get_context", get_context)
     calls = []
     loaders = []
     try:
+        dist.init_process_group(
+            "gloo", init_method=f"file://{tmp_path}/pg", rank=0, world_size=1
+        )
+        monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
         with patched_num_microbatches(k):
             assert config_module.get_num_microbatches() == k
             config = CacheResumeMMAPConfig(
@@ -212,4 +221,5 @@ def test_mmap_resume_step_chain(k, tmp_path, monkeypatch):
     finally:
         for dataloader in loaders:
             dataloader.stop()
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
