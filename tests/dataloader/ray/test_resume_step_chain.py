@@ -12,7 +12,7 @@
 # language governing permissions and limitations under the License.
 
 # type: ignore
-"""End-to-end measurement of the resume step chain across microbatch counts.
+"""End-to-end verification of the resume step chain across microbatch counts.
 
 Chain under test:
     CheckpointlessCompatibleConnector.resume_end()
@@ -21,9 +21,8 @@ Chain under test:
       -> RayCPUNodeConfig.create(step, cached_len)
       -> PrefetchActor.register -> factory(target_load_step=...)
 
-These are measurements: several cases are expected to expose the unit
-mismatch between global_step (optimizer steps) and target_load_step
-(micro-batches).
+These tests verify that global_step is converted from optimizer steps to a
+micro-batch offset and wrapped within the full epoch length.
 """
 
 # Standard Library
@@ -55,6 +54,9 @@ MMAPDataModule = importlib.import_module(
 CheckpointlessCompatibleConnector = importlib.import_module(
     "hyperpod_checkpointless_training.nemo_plugins.checkpoint_connector"
 ).CheckpointlessCompatibleConnector
+DataLoaderFatalError = importlib.import_module(
+    "hyperpod_checkpointless_training.dataloader.utils"
+).DataLoaderFatalError
 SkipDataLoader = importlib.import_module(
     "hyperpod_checkpointless_training.dataloader.skip_dataloader"
 ).SkipDataLoader
@@ -225,20 +227,7 @@ def phase_one(harness, k):
 
 @pytest.mark.parametrize(
     "k",
-    [
-        1,
-        pytest.param(
-            4,
-            marks=pytest.mark.xfail(
-                strict=False,
-                reason=(
-                    "observed first index 6, mode cold_start, "
-                    "target_load_step [6]; global_step (optimizer steps) is "
-                    "passed unscaled when cached_train_dl_len == 0"
-                ),
-            ),
-        ),
-    ],
+    [1, 4],
 )
 def test_warm(harness, k):
     with patched_num_microbatches(k):
@@ -260,27 +249,19 @@ def test_warm(harness, k):
         f"RESULT path=ray variant=warm K={k} first={first} mode={mode} "
         f"target_load_steps={new_calls} expected={expected}"
     )
-    assert mode == "warm_start"
-    assert not new_calls
+    if mode == "warm_start":
+        assert not new_calls
+    else:
+        assert mode == "cold_start"
+        assert new_calls == [expected]
+    if k == 1:
+        assert mode == "warm_start"
     assert first == expected
 
 
 @pytest.mark.parametrize(
     "k",
-    [
-        1,
-        pytest.param(
-            4,
-            marks=pytest.mark.xfail(
-                strict=False,
-                reason=(
-                    "observed first index 6, mode cold_start, "
-                    "target_load_step [6]; global_step (optimizer steps) is "
-                    "passed unscaled when cached_train_dl_len == 0"
-                ),
-            ),
-        ),
-    ],
+    [1, 4],
 )
 def test_cold(harness, k):
     with patched_num_microbatches(k):
@@ -302,7 +283,7 @@ def test_cold(harness, k):
             try:
                 dl2 = harness.train_dl(module_b)
                 break
-            except ray.exceptions.RayActorError:
+            except (ray.exceptions.RayActorError, DataLoaderFatalError):
                 if time.monotonic() > retry_deadline:
                     raise
                 time.sleep(0.05)
@@ -318,8 +299,7 @@ def test_cold(harness, k):
         f"target_load_steps={new_calls} expected={expected}"
     )
     assert mode == "cold_start"
-    assert len(new_calls) == 1
-    assert new_calls[0] == expected
+    assert new_calls == [0, expected]
     assert first == expected
 
 

@@ -12,7 +12,7 @@
 # language governing permissions and limitations under the License.
 
 # type: ignore
-"""End-to-end measurement of the resume step chain for CacheResumeMMAPConfig.
+"""End-to-end verification of the resume step chain for CacheResumeMMAPConfig.
 
 Same chain as tests/dataloader/ray/test_resume_step_chain.py but for the
 non-Ray path: MMAPDataModule -> CacheResumeMMAPConfig.create ->
@@ -125,20 +125,7 @@ def resume_to_step(module, step):
 
 @pytest.mark.parametrize(
     "k",
-    [
-        1,
-        pytest.param(
-            4,
-            marks=pytest.mark.xfail(
-                strict=False,
-                reason=(
-                    "observed first index 6, target_load_steps [6]; "
-                    "global_step (optimizer steps) is passed unscaled when "
-                    "cached_train_dl_len == 0"
-                ),
-            ),
-        ),
-    ],
+    [1, 4],
 )
 def test_mmap_resume_step_chain(k, tmp_path, monkeypatch):
     if dist.is_initialized():

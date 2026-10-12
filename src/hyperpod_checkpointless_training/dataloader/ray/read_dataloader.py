@@ -154,13 +154,20 @@ class RayReadDataLoader:
         """Length reported by the producer actor (``len`` of the CPU-node dataloader)."""
         if not self._is_val and self.restart_info is not None:
             return self.restart_info.get("length")
+        return self.remote_length_from_actor(
+            self._actor, self._consumer_id, self._register_timeout_s
+        )
+
+    @staticmethod
+    def remote_length_from_actor(
+        actor, consumer_id: int, register_timeout_s: float
+    ) -> int | None:
+        """Read the producer length before a consumer loader has registered."""
         try:
-            return ray.get(
-                self._actor.length.remote(), timeout=self._register_timeout_s
-            )
+            return ray.get(actor.length.remote(), timeout=register_timeout_s)
         except _FATAL_RAY_ERRORS as e:
             raise dlu.DataLoaderFatalError(
-                f"[{self._consumer_id}] Failed to read dataloader length: {e}"
+                f"[{consumer_id}] Failed to read dataloader length: {e}"
             ) from e
 
     def _register(self, step: int, reseek_token: str | None) -> dict:

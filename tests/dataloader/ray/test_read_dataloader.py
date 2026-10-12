@@ -244,6 +244,17 @@ def test_val_length_uses_register_timeout():
     assert dl.remote_length() == 3
 
 
+def test_remote_length_from_actor_wraps_timeout():
+    actor = StubPrefetchActor.remote(length=3, length_delay_s=1.5)
+
+    with pytest.raises(DataLoaderFatalError) as exc_info:
+        RayReadDataLoader.remote_length_from_actor(
+            actor, consumer_id=3, register_timeout_s=0.3
+        )
+
+    assert isinstance(exc_info.value.__cause__, ray.exceptions.GetTimeoutError)
+
+
 def test_stop_from_other_thread_while_blocked_on_pending():
     """stop() returns promptly and the blocked __next__ raises RuntimeError (not StopIteration)."""
     actor = StubPrefetchActor.remote(pending_polls=10**9)

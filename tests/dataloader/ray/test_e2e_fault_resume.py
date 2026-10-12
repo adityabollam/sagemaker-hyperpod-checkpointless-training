@@ -172,7 +172,10 @@ def e2e(tmp_path):
             parallel_state_util.parallel_state.get_data_parallel_world_size.return_value = (
                 dp_size
             )
-            with patch.object(config_module.dist, "get_rank", return_value=consumer_id):
+            with (
+                patch.object(config_module.dist, "get_rank", return_value=consumer_id),
+                patch.object(config_module, "get_num_microbatches", return_value=1),
+            ):
                 loader = config.create(
                     None,
                     parallel_state_util,
@@ -307,7 +310,7 @@ def test_actor_loss_recreates_and_resumes_from_checkpoint(e2e):
         try:
             resumed = harness.create(step=2)
             break
-        except ray.exceptions.RayActorError:
+        except (ray.exceptions.RayActorError, dlu.DataLoaderFatalError):
             time.sleep(0.05)
     else:
         pytest.fail("could not recreate the prefetch actor within 5 seconds")

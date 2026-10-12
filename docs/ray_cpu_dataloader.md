@@ -81,7 +81,10 @@ forever. The window therefore keeps a lease per consumer (`last_seen`), refreshe
    constructor calls `actor.register(consumer_id=global_rank, step=global_step)`. The first register
    on a fresh actor reseeks: it builds the dataloader at `target_load_step=step` and starts the
    producer thread. Response mode is `COLD_START`.
-4. Length comes from `actor.length()` (= `len(dataloader)`), so no TP `all_reduce` is needed.
+4. Length comes from `actor.length()` (= `len(dataloader)`), so no TP `all_reduce` is needed. The
+   factory's `len()` must report the full epoch length regardless of `target_load_step`. When a
+   train resume has no cached datamodule state and a non-zero `global_step`, the config uses that
+   full length to convert optimizer steps to micro-batch offsets and wrap within the epoch.
 
 ### Fault -> in-process restart, CPU node alive (WARM_START)
 
@@ -355,8 +358,9 @@ class RayCPUNodeConfig(MMAPConfig):
         # 1. validate step is not None and cpu_dataloader_factory is set (ValueError otherwise)
         # 2. import ray lazily; if not ray.is_initialized(): ray.init(address=ray_address,
         #    namespace=ray_namespace, ignore_reinit_error=True)
-        # 3. step = 0 if is_val; for train only, if cached_len:
-        #    cached_len, step = self._adjust_for_epoch_resume(cached_len, step)
+        # 3. step = 0 if is_val; for train, use cached_len or actor.length() to convert
+        #    optimizer steps to a wrapped micro-batch offset. The factory's len() must report
+        #    the full epoch length regardless of target_load_step.
         # 4. ps = parallel_state_util.parallel_state; dp_rank = ps.get_data_parallel_rank();
         #    dp_size = ps.get_data_parallel_world_size()
         # 5. actor = get_or_create_prefetch_actor(job_name, split="val" if is_val else "train", ...)
@@ -368,7 +372,8 @@ class RayCPUNodeConfig(MMAPConfig):
         #    Call dl.set_length(length); log like the existing config; return dl.
 ```
 
-`MMAPDataModule` needs no change: it calls `mmap_config.create(...)` with the same signature.
+`MMAPDataModule` caches the explicit `epoch_length` supplied by the config, falling back to the
+visible loader length when that attribute is unavailable.
 
 ## Examples / deployment
 

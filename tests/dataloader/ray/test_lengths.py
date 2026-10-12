@@ -222,6 +222,7 @@ def length_harness(tmp_path):
             consumer_id=0,
             is_val=False,
             cached_len=0,
+            num_microbatches=1,
         ):
             split = "val" if is_val else "train"
             actor_name = prefetch_actor_name(config.job_name, split, dp_rank)
@@ -235,7 +236,11 @@ def length_harness(tmp_path):
             )
             with (
                 patch.object(config_module.dist, "get_rank", return_value=consumer_id),
-                patch.object(config_module, "get_num_microbatches", return_value=1),
+                patch.object(
+                    config_module,
+                    "get_num_microbatches",
+                    return_value=num_microbatches,
+                ),
             ):
                 loader = config.create(
                     None,
@@ -468,6 +473,15 @@ def test_fresh_nonzero_step_reports_remaining_and_rolls_over(length_harness):
     assert drain(loader) == list(range(5, 12))
     assert drain(loader) == list(range(12))
     assert len(loader) == 12
+
+
+def test_stateless_resume_scales_and_wraps_with_microbatches(length_harness):
+    harness = length_harness(n_items=12)
+    loader = harness.create(step=5, num_microbatches=4)
+
+    assert len(loader) == 4
+    assert drain(loader) == [8, 9, 10, 11]
+    assert drain(loader) == list(range(12))
 
 
 def test_tp_siblings_rollover_via_new_create(length_harness):

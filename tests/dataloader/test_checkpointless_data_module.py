@@ -13,7 +13,15 @@
 
 # type: ignore
 import unittest
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock
+
+# isort: off
+from hyperpod_checkpointless_training.dataloader.mmap_data_module import (
+    FakeDataset,
+    MMAPDataModule,
+)
+
+# isort: on
 
 
 class MockLightningDataModule:
@@ -34,12 +42,6 @@ class MockDataset:
 
     def __getitem__(self, idx):
         raise IndexError("FakeDataset has no items")
-
-
-from hyperpod_checkpointless_training.dataloader.mmap_data_module import (
-    MMAPDataModule,
-    FakeDataset,
-)
 
 
 class TestMMAPDataModule(unittest.TestCase):
@@ -67,8 +69,12 @@ class TestMMAPDataModule(unittest.TestCase):
     def test_init(self):
         self.assertEqual(self.mmap_module.data_module, self.mock_data_module)
         self.assertEqual(self.mmap_module.mmap_config, self.mock_mmap_config)
-        self.assertEqual(self.mmap_module._parallel_state_util, self.mock_parallel_state_util)
-        self.assertEqual(self.mmap_module._is_data_loading_rank, self.mock_is_data_loading_rank)
+        self.assertEqual(
+            self.mmap_module._parallel_state_util, self.mock_parallel_state_util
+        )
+        self.assertEqual(
+            self.mmap_module._is_data_loading_rank, self.mock_is_data_loading_rank
+        )
 
     def test_setup_data_loading_rank(self):
         self.mock_is_data_loading_rank.return_value = True
@@ -90,6 +96,7 @@ class TestMMAPDataModule(unittest.TestCase):
         self.mock_is_data_loading_rank.return_value = True
         mock_dataloader = Mock()
         mock_dataloader.__len__ = Mock(return_value=100)
+        mock_dataloader.epoch_length = None
         self.mock_mmap_config.create.return_value = mock_dataloader
 
         result = self.mmap_module.train_dataloader()
@@ -110,6 +117,7 @@ class TestMMAPDataModule(unittest.TestCase):
         self.mock_is_data_loading_rank.return_value = False
         mock_dataloader = Mock()
         mock_dataloader.__len__ = Mock(return_value=100)
+        mock_dataloader.epoch_length = None
         self.mock_mmap_config.create.return_value = mock_dataloader
 
         result = self.mmap_module.train_dataloader()
@@ -155,9 +163,9 @@ class TestMMAPDataModule(unittest.TestCase):
     def test_load_checkpoint(self):
         """Test load_checkpoint method sets global_step."""
         checkpoint = {"global_step": 150}
-        
+
         self.mmap_module.load_checkpoint(checkpoint)
-        
+
         self.assertEqual(self.mmap_module.global_step, 150)
 
     def test_train_dataloader_caches_length(self):
@@ -165,12 +173,27 @@ class TestMMAPDataModule(unittest.TestCase):
         self.mock_is_data_loading_rank.return_value = True
         mock_dataloader = Mock()
         mock_dataloader.__len__ = Mock(return_value=100)
+        mock_dataloader.epoch_length = None
         self.mock_mmap_config.create.return_value = mock_dataloader
-        
+
         result = self.mmap_module.train_dataloader()
-        
+
         self.assertEqual(result, mock_dataloader)
         self.assertEqual(self.mmap_module.cached_train_dl_len, 100)
+
+    def test_stateless_resume_caches_full_epoch_length(self):
+        self.mock_is_data_loading_rank.return_value = True
+        self.mmap_module.global_step = 30
+        mock_dataloader = Mock()
+        mock_dataloader.__len__ = Mock(return_value=80)
+        mock_dataloader.epoch_length = 100
+        self.mock_mmap_config.create.return_value = mock_dataloader
+
+        self.mmap_module.train_dataloader()
+
+        self.assertEqual(self.mmap_module.cached_train_dl_len, 100)
+        self.assertEqual(self.mock_mmap_config.create.call_args.kwargs["cached_len"], 0)
+        self.assertEqual(self.mock_mmap_config.create.call_args.args[2], 30)
 
     def test_val_dataloader_caches_length(self):
         """Test that val_dataloader caches the dataloader length."""
@@ -178,9 +201,9 @@ class TestMMAPDataModule(unittest.TestCase):
         mock_dataloader = Mock()
         mock_dataloader.__len__ = Mock(return_value=50)
         self.mock_mmap_config.create.return_value = mock_dataloader
-        
+
         result = self.mmap_module.val_dataloader()
-        
+
         self.assertEqual(result, mock_dataloader)
         self.assertEqual(self.mmap_module.cached_val_dl_len, 50)
 
@@ -189,24 +212,25 @@ class TestMMAPDataModule(unittest.TestCase):
         # Set initial cached lengths
         self.mmap_module.cached_train_dl_len = 75
         self.mmap_module.cached_val_dl_len = 25
-        
+
         mock_train_dl = Mock()
         mock_train_dl.__len__ = Mock(return_value=80)
+        mock_train_dl.epoch_length = None
         mock_val_dl = Mock()
         mock_val_dl.__len__ = Mock(return_value=30)
-        
+
         self.mock_mmap_config.create.side_effect = [mock_train_dl, mock_val_dl]
-        
+
         # Call train_dataloader
         self.mmap_module.train_dataloader()
-        
+
         # Verify cached_len was passed for train
         train_call_args = self.mock_mmap_config.create.call_args_list[0]
         self.assertEqual(train_call_args[1]["cached_len"], 75)
-        
+
         # Call val_dataloader
         self.mmap_module.val_dataloader()
-        
+
         # Verify cached_len was passed for val
         val_call_args = self.mock_mmap_config.create.call_args_list[1]
         self.assertEqual(val_call_args[1]["cached_len"], 25)
@@ -215,24 +239,18 @@ class TestMMAPDataModule(unittest.TestCase):
         """Test state_dict method returns cached lengths."""
         self.mmap_module.cached_train_dl_len = 150
         self.mmap_module.cached_val_dl_len = 75
-        
+
         result = self.mmap_module.state_dict()
-        
-        expected = {
-            "cached_train_dl_len": 150,
-            "cached_val_dl_len": 75
-        }
+
+        expected = {"cached_train_dl_len": 150, "cached_val_dl_len": 75}
         self.assertEqual(result, expected)
 
     def test_load_state_dict(self):
         """Test load_state_dict method loads cached lengths."""
-        state_dict = {
-            "cached_train_dl_len": 200,
-            "cached_val_dl_len": 100
-        }
-        
+        state_dict = {"cached_train_dl_len": 200, "cached_val_dl_len": 100}
+
         self.mmap_module.load_state_dict(state_dict)
-        
+
         self.assertEqual(self.mmap_module.cached_train_dl_len, 200)
         self.assertEqual(self.mmap_module.cached_val_dl_len, 100)
 
@@ -240,36 +258,41 @@ class TestMMAPDataModule(unittest.TestCase):
         """Test that cached lengths persist and update across multiple dataloader calls."""
         mock_train_dl1 = Mock()
         mock_train_dl1.__len__ = Mock(return_value=100)
+        mock_train_dl1.epoch_length = None
         mock_train_dl2 = Mock()
         mock_train_dl2.__len__ = Mock(return_value=120)
-        
+        mock_train_dl2.epoch_length = None
+
         mock_val_dl1 = Mock()
         mock_val_dl1.__len__ = Mock(return_value=50)
         mock_val_dl2 = Mock()
         mock_val_dl2.__len__ = Mock(return_value=60)
-        
+
         self.mock_mmap_config.create.side_effect = [
-            mock_train_dl1, mock_val_dl1, mock_train_dl2, mock_val_dl2
+            mock_train_dl1,
+            mock_val_dl1,
+            mock_train_dl2,
+            mock_val_dl2,
         ]
-        
+
         # First round of calls
         self.mmap_module.train_dataloader()
         self.mmap_module.val_dataloader()
-        
+
         self.assertEqual(self.mmap_module.cached_train_dl_len, 100)
         self.assertEqual(self.mmap_module.cached_val_dl_len, 50)
-        
+
         # Second round of calls - should pass cached lengths and update them
         self.mmap_module.train_dataloader()
         self.mmap_module.val_dataloader()
-        
+
         self.assertEqual(self.mmap_module.cached_train_dl_len, 120)
         self.assertEqual(self.mmap_module.cached_val_dl_len, 60)
-        
+
         # Verify all create calls were made with correct cached_len parameters
         create_calls = self.mock_mmap_config.create.call_args_list
         self.assertEqual(len(create_calls), 4)
-        
+
         # First train call - no cached length
         self.assertEqual(create_calls[0][1]["cached_len"], 0)
         # First val call - no cached length
