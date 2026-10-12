@@ -120,6 +120,8 @@ class RayReadDataLoader:
         self._step = 0 if is_val else step
         self._length = None
         self._num_iters = 0
+        self._generation = None
+        self._exhausted = False
         self._encryption_manager = None
         self._registration_id = None
         self._state = None
@@ -176,6 +178,7 @@ class RayReadDataLoader:
             f"reseek_token={reseek_token}: {info}"
         )
         self._registration_id = info["registration_id"]
+        self._generation = info.get("generation")
         return info
 
     def _get_encryption_manager(self):
@@ -191,13 +194,29 @@ class RayReadDataLoader:
         self.stop()
         if self._is_val:
             self._step = 0
-            self.restart_info = self._register(0, f"val-{self._num_iters}")
+            token = (
+                None if self._generation is None else f"val-after-gen{self._generation}"
+            )
+            self.restart_info = self._register(0, token)
+        elif self._exhausted:
+            token = f"train-rollover-gen{self._generation}"
+            self._step = 0
+            self.restart_info = self._register(0, token)
+            epoch_length = self.restart_info.get("length")
+            if epoch_length is not None:
+                self._length = epoch_length
+            else:
+                self._logger.warning(
+                    f"[{self._consumer_id}] Prefetch actor did not report a length "
+                    "after train rollover; keeping the previous length."
+                )
+        self._exhausted = False
         self._num_iters += 1
 
         state = _IterState(self._prefetch_length)
         state.thread = threading.Thread(
             target=self._fetch_loop,
-            args=(state, self._step),
+            args=(state, self._step, self._generation),
             name=f"RayReadDataLoader-fetch-{self._consumer_id}",
             daemon=True,
         )
@@ -211,6 +230,7 @@ class RayReadDataLoader:
             while True:
                 item = self._next_item(state)
                 if item is _FINAL:
+                    self._exhausted = True
                     self._logger.debug(
                         f"[{self._consumer_id}] Reached final step {self._step}."
                     )
@@ -293,11 +313,11 @@ class RayReadDataLoader:
                 continue
         return False
 
-    def _fetch_loop(self, state: _IterState, step: int) -> None:
+    def _fetch_loop(self, state: _IterState, step: int, generation: int | None) -> None:
         try:
             while not state.stop_event.is_set():
                 status, payload = self._rpc_get(
-                    self._actor.get_ref.remote(step, self._consumer_id),
+                    self._actor.get_ref.remote(step, self._consumer_id, generation),
                     state.stop_event,
                 )
                 if status == "pending":
@@ -313,6 +333,12 @@ class RayReadDataLoader:
                 elif status == "final":
                     self._put(state, _FINAL)
                     return
+                elif status == "superseded":
+                    raise RuntimeError(
+                        f"[{self._consumer_id}] Prefetch actor generation {generation} "
+                        "was superseded by another consumer's reseek before "
+                        f"step {step} was read."
+                    )
                 elif status == "evicted":
                     raise RuntimeError(
                         f"[{self._consumer_id}] Step {step} was evicted from the prefetch "

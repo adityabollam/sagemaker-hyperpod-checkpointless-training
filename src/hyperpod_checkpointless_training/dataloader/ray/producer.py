@@ -85,6 +85,7 @@ class PrefetchActor:
         self._last_reseek_token = None
         self._registration_counter = 0
         self._consumer_registration_ids: dict[int, int] = {}
+        self._retired_final_steps: dict[int, int] = {}
         self._stop_event = threading.Event()
         self._wakeup = threading.Event()
         self._producer_thread = None
@@ -107,10 +108,26 @@ class PrefetchActor:
             elif not self._window.can_resume_from(step):
                 reason = "outside_window"
             elif reseek_token is not None and reseek_token != self._last_reseek_token:
-                reason = "reseek_token_changed"
+                if (
+                    self._is_val
+                    and reseek_token == f"val-after-gen{self._generation - 1}"
+                ):
+                    self._last_reseek_token = reseek_token
+                else:
+                    reason = "reseek_token_changed"
 
             if reason is not None:
                 known_consumers = dict(self._window.last_seen)
+                if self._window.final_step is not None:
+                    self._retired_final_steps[self._generation] = (
+                        self._window.final_step
+                    )
+                    while len(self._retired_final_steps) > 8:
+                        oldest_generation = next(iter(self._retired_final_steps))
+                        self._retired_final_steps.pop(oldest_generation)
+                for known in known_consumers:
+                    if known != consumer_id:
+                        self._consumer_registration_ids.pop(known, None)
                 dropped = self._window.reset(step)
                 del dropped
                 for known_consumer_id, seen in known_consumers.items():
@@ -164,6 +181,7 @@ class PrefetchActor:
                 "mode": mode,
                 "length": self._length,
                 "registration_id": registration_id,
+                "generation": self._generation,
                 **self._window.snapshot(),
             }
 
@@ -185,10 +203,20 @@ class PrefetchActor:
             self._producer_thread_generation = generation
             self._producer_thread.start()
 
-    def get_ref(self, step: int, consumer_id: int | None = None) -> tuple[str, list]:
+    def get_ref(
+        self,
+        step: int,
+        consumer_id: int | None = None,
+        generation: int | None = None,
+    ) -> tuple[str, list]:
         with self._lock:
             if consumer_id is not None:
                 self._window.touch(consumer_id)
+            if generation is not None and generation != self._generation:
+                final_step = self._retired_final_steps.get(generation)
+                if final_step is not None and step >= final_step:
+                    return "final", []
+                return "superseded", []
             status, ref = self._window.lookup(step)
             if status == "ready":
                 return "ready", [ref]

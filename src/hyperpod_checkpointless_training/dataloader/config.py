@@ -235,7 +235,7 @@ class RayCPUNodeConfig(MMAPConfig):
         step = 0 if is_val else step
         prefetch_length = self.val_prefetch_length if is_val else self.prefetch_length
 
-        if cached_len:
+        if cached_len and not is_val:
             cached_len, step = self._adjust_for_epoch_resume(cached_len, step)
 
         parallel_state = parallel_state_util.parallel_state
@@ -267,7 +267,13 @@ class RayCPUNodeConfig(MMAPConfig):
             register_timeout_s=self.register_timeout_s,
         )
 
-        data_loader.set_length(max(cached_len, data_loader.remote_length() or 0))
+        if is_val:
+            length = data_loader.remote_length() or cached_len
+        elif cached_len:
+            length = cached_len
+        else:
+            length = data_loader.remote_length() or 0
+        data_loader.set_length(length)
         if len(data_loader) == 0:
             logger.warning(
                 debug_msg(
