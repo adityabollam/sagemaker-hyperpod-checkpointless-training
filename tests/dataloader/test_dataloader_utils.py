@@ -18,6 +18,7 @@ from unittest.mock import patch, MagicMock
 from hyperpod_checkpointless_training.dataloader.utils import (
     CheckpointlessTrainingDataloader,
     CheckpointlessDataModule,
+    DataLoaderFatalError,
     DummyDataset,
     FakeDataset,
 )
@@ -54,7 +55,7 @@ class TestCheckpointlessDataModule(unittest.TestCase):
         self.assertFalse(self.checkpointless_datamodule.use_original)
 
     def test_init_validation(self):
-        with self.assertRaises(ValueError) as context:
+        with self.assertRaises(ValueError):
             self.checkpointless_datamodule = CheckpointlessDataModule(
                 cfg=MagicMock(),
                 global_batch_size=self.global_batch_size,
@@ -112,7 +113,7 @@ class TestCheckpointlessDataModule(unittest.TestCase):
             enable_inprocess=True,
         )
 
-        with self.assertRaises(RuntimeError) as context:
+        with self.assertRaises(RuntimeError):
             invalid_checkpointless_datamodule.train_dataloader()
 
     def test_val_dataloader(self):
@@ -269,6 +270,35 @@ class TestCheckpointlessTrainingDataloader(unittest.TestCase):
             iterator
         )  # Should return empty list since stop event is set
         self.assertEqual(len(remaining_batches), 0)
+
+    def test_iterator_reraises_fatal_error(self):
+        def raise_fatal_error():
+            raise DataLoaderFatalError("actor died")
+            yield
+
+        self.mock_dataloader.__iter__.return_value = raise_fatal_error()
+
+        with self.assertRaises(DataLoaderFatalError):
+            list(self.batch_dataloader)
+
+    def test_iterator_swallows_plain_exception(self):
+        def raise_error():
+            raise ValueError("ordinary error")
+            yield
+
+        self.mock_dataloader.__iter__.return_value = raise_error()
+
+        self.assertEqual(list(self.batch_dataloader), [])
+
+    def test_iterator_swallows_fatal_error_after_stop(self):
+        def raise_fatal_error():
+            raise DataLoaderFatalError("actor died")
+            yield
+
+        self.batch_dataloader._stop_event.set()
+        self.mock_dataloader.__iter__.return_value = raise_fatal_error()
+
+        self.assertEqual(list(self.batch_dataloader), [])
 
     def test_cleanup_custom_components(self):
         """Test the _cleanup_custom_components hook method"""

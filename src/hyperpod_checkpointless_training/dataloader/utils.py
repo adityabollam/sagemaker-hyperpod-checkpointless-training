@@ -26,6 +26,10 @@ from hyperpod_checkpointless_training.inprocess.abort import HPDataLoaderManager
 hp_logger = get_logger(__name__)
 
 
+class DataLoaderFatalError(RuntimeError):
+    """An error that should stop training instead of ending an epoch."""
+
+
 class FakeDataset(Dataset):
     def __init__(self, seq_length: int = 8192, dataset_length: int = 20365052):
         self.seq_length = seq_length
@@ -206,6 +210,8 @@ class CheckpointlessTrainingDataloader:
             hp_logger.error(
                 debug_msg(f"Error during dataloader generating batches {e}")
             )
+            if isinstance(e, DataLoaderFatalError) and not self._stop_event.is_set():
+                raise
 
     def __getattr__(self, name):
         # Pipe all unknown attributes to the wrapped dataloader.
