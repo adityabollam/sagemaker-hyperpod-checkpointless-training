@@ -132,6 +132,34 @@ class BlockingFactory:
         return BlockingDataLoader()
 
 
+class GenerationBlockingFactory:
+    def __init__(self, n, blocked_generation, blocked_step):
+        self.n = n
+        self.blocked_generation = blocked_generation
+        self.blocked_step = blocked_step
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def __call__(self, *, dp_rank, dp_size, target_load_step, is_val):
+        self.calls += 1
+        generation = self.calls
+        factory = self
+
+        class GenerationBlockingDataLoader:
+            def __iter__(self):
+                for step in range(target_load_step, factory.n):
+                    if (
+                        generation == factory.blocked_generation
+                        and step == factory.blocked_step
+                    ):
+                        factory.started.set()
+                        factory.release.wait()
+                    yield {"tokens": torch.full((2, 4), step)}
+
+        return GenerationBlockingDataLoader()
+
+
 def wait_until(predicate, timeout=5):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -458,6 +486,27 @@ def test_stale_in_flight_batch_is_dropped_on_reseek(actor_factory):
     assert wait_until(lambda: actor.get_ref(2)[0] == "ready")
     assert list(actor._window.refs) == [2, 3, 4]
     assert actor.get_ref(0)[0] == "evicted"
+
+
+def test_reseek_starts_a_new_producer_when_old_next_is_blocked(actor_factory):
+    factory = GenerationBlockingFactory(10, blocked_generation=1, blocked_step=5)
+    actor = actor_factory(factory, lookback_length=0, prefetch_length=6)
+    registration = actor.register(0, 0)
+    assert factory.started.wait(timeout=2)
+    assert actor.stats()["producer_step"] == 5
+
+    actor.ack(0, 5, registration["registration_id"])
+    assert actor.stats()["low_watermark"] == 5
+    assert actor.register(0, 2)["mode"] == "cold_start"
+
+    for step in range(2, 5):
+        assert wait_until(lambda step=step: actor.get_ref(step)[0] == "ready")
+        status, payload = actor.get_ref(step)
+        assert status == "ready"
+        assert torch.equal(payload[0]["tokens"], torch.full((2, 4), step))
+
+    assert factory.calls == 2
+    factory.release.set()
 
 
 def test_shutdown_stops_producer_thread_and_is_idempotent(actor_factory):

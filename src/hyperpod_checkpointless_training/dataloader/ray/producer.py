@@ -78,6 +78,7 @@ class PrefetchActor:
         self._stop_event = threading.Event()
         self._wakeup = threading.Event()
         self._producer_thread = None
+        self._producer_thread_generation = None
         self._encryption_manager = None
         self._shutdown_complete = False
 
@@ -157,12 +158,19 @@ class PrefetchActor:
     def _ensure_producer_thread(self) -> None:
         if self._stop_event.is_set():
             return
-        if self._producer_thread is None or not self._producer_thread.is_alive():
+        if (
+            self._producer_thread is None
+            or not self._producer_thread.is_alive()
+            or self._producer_thread_generation != self._generation
+        ):
+            generation = self._generation
             self._producer_thread = threading.Thread(
                 target=self._produce_loop,
+                args=(generation,),
                 name=f"hpct-prefetch-dp{self._dp_rank}",
                 daemon=True,
             )
+            self._producer_thread_generation = generation
             self._producer_thread.start()
 
     def get_ref(self, step: int) -> tuple[str, list]:
@@ -242,9 +250,11 @@ class PrefetchActor:
             self._encryption_manager = KMSEncryptionManager()
         return self._encryption_manager
 
-    def _produce_loop(self) -> None:
+    def _produce_loop(self, generation: int) -> None:
         while not self._stop_event.is_set():
             with self._lock:
+                if generation != self._generation:
+                    return
                 can_produce = (
                     self._iter is not None
                     and not (
@@ -253,7 +263,6 @@ class PrefetchActor:
                     and self._window.should_produce()
                 )
                 if can_produce:
-                    generation = self._generation
                     iterator = self._iter
                     step = self._window.producer_step
 
@@ -264,19 +273,22 @@ class PrefetchActor:
 
             try:
                 batch = next(iterator)
+                with self._lock:
+                    if generation != self._generation:
+                        return
             except StopIteration:
                 with self._lock:
-                    if (
-                        generation == self._generation
-                        and self._window.producer_step == step
-                    ):
+                    if generation != self._generation:
+                        return
+                    if self._window.producer_step == step:
                         self._window.mark_final()
                 continue
             except Exception:
                 error = traceback.format_exc()
                 with self._lock:
-                    if generation == self._generation:
-                        self._error = (generation, error)
+                    if generation != self._generation:
+                        return
+                    self._error = (generation, error)
                 logger.error(
                     "Failed to produce batch for dp_rank=%s step=%s:\n%s",
                     self._dp_rank,
@@ -295,8 +307,9 @@ class PrefetchActor:
             except Exception:
                 error = traceback.format_exc()
                 with self._lock:
-                    if generation == self._generation:
-                        self._error = (generation, error)
+                    if generation != self._generation:
+                        return
+                    self._error = (generation, error)
                 logger.error(
                     "Failed to publish batch for dp_rank=%s step=%s:\n%s",
                     self._dp_rank,
@@ -306,10 +319,9 @@ class PrefetchActor:
                 continue
 
             with self._lock:
-                if (
-                    generation == self._generation
-                    and self._window.producer_step == step
-                ):
+                if generation != self._generation:
+                    return
+                if self._window.producer_step == step:
                     self._window.add(step, ref)
                     ref = None
             del ref
