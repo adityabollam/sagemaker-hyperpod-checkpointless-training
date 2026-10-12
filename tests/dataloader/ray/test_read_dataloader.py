@@ -48,6 +48,7 @@ class StubPrefetchActor:
         pending_polls=0,
         evicted_below=None,
         error_step=None,
+        superseded_from=None,
         payload_fn=None,
         get_ref_delay_s=0.0,
         register_delay_s=0.0,
@@ -58,6 +59,7 @@ class StubPrefetchActor:
         self.pending_polls = pending_polls
         self.evicted_below = evicted_below
         self.error_step = error_step
+        self.superseded_from = superseded_from
         self.payload_fn = payload_fn or (lambda s: {"step": s})
         self.get_ref_delay_s = get_ref_delay_s
         self.register_delay_s = register_delay_s
@@ -81,11 +83,14 @@ class StubPrefetchActor:
             "length": self._length,
             "producer_step": step,
             "registration_id": registration_id,
+            "generation": registration_id,
         }
 
-    def get_ref(self, step):
+    def get_ref(self, step, generation=None):
         if self.get_ref_delay_s:
             time.sleep(self.get_ref_delay_s)
+        if self.superseded_from is not None and step >= self.superseded_from:
+            return "superseded", []
         if self.error_step is not None and step >= self.error_step:
             return "error", ["Traceback: boom"]
         if self.evicted_below is not None and step < self.evicted_below:
@@ -170,6 +175,13 @@ def test_evicted_raises():
     actor = StubPrefetchActor.remote(evicted_below=10)
     dl = _make(actor, step=2)
     with pytest.raises(RuntimeError, match="evicted"):
+        next(iter(dl))
+
+
+def test_superseded_generation_raises():
+    actor = StubPrefetchActor.remote(superseded_from=0)
+    dl = _make(actor)
+    with pytest.raises(RuntimeError, match="superseded"):
         next(iter(dl))
 
 
@@ -293,8 +305,8 @@ def test_val_reregisters_each_iter_from_step_zero():
     assert len(dl) == 3
     assert [b["step"] for b in dl] == [0, 1, 2]
     assert ray.get(actor.get_registrations.remote()) == [
-        (3, 0, "val-0"),
-        (3, 0, "val-1"),
+        (3, 0, None),
+        (3, 0, "val-after-gen1"),
     ]
 
 

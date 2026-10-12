@@ -72,8 +72,14 @@ Problems this solves:
    consumed; the `lookback_length` window exists for exactly this).
 3. `register(consumer_id, step)`: if `window.can_resume_from(step)` the actor keeps its window and
    cursor (`WARM_START`); the consumer starts reading at `step` immediately. Otherwise the actor
-   resets the window and reseeks the dataloader to `step` (`COLD_START`).
+   resets the window and reseeks the dataloader to `step` (`COLD_START`). A reseek invalidates the
+   other consumers' registration ids while keeping them registered at the reseek step, so stale
+   acknowledgements cannot move the new window.
 4. No collective is needed: the window is central, so the old min-prune across PDLs disappears.
+
+After a training consumer reaches the actor's final step, its next `__iter__` registers at step 0
+with a token for the generation it just finished. This lets TP siblings share one reseek for the
+next epoch. Validation continues to register at step 0 on every pass.
 
 ### CPU node failure
 
@@ -88,10 +94,12 @@ warm restart of the CPU tier itself, hierarchical relay for very large fan-out.
 
 ### Validation dataloader
 
-`is_val=True` -> step is always 0 and every `__iter__` must restart from 0 (same as
-`force_cold_start` today). Each consumer counts its own `__iter__` calls and passes
-`reseek_token=f"val-{n}"`; the actor reseeks only when the token differs from the last one it saw,
-so the N consumers of one DP replica trigger exactly one reseek per validation epoch.
+`is_val=True` -> step is always 0 and every `__iter__` restarts from 0 (same as `force_cold_start`
+today). A consumer's first registration has no reseek token, allowing a delayed sibling to join the
+current pass when step 0 remains in the window. Later passes use
+`reseek_token=f"val-after-gen{generation}"`, so siblings with different pass counts trigger one
+reseek per generation instead of reseeking each other mid-pass. If a sibling already reseeked for
+that next generation, the actor treats the generation-chained token as already satisfied.
 
 ## Package layout
 
@@ -186,10 +194,15 @@ class PrefetchActor:
         #   reseek = window.reset(step); bump self._generation; build dataloader via factory at
         #            target_load_step=step; self._iter = iter(dl); self._length = len(dl) if possible;
         #            clear stored producer error; remember reseek_token; ensure producer thread running.
+        #   on reseek, retain any final_step under the retired generation and invalidate other
+        #            consumers' registration ids (their consumer_steps remain at the reseek step).
         #   window.register_consumer(consumer_id, step)
-        # Returns {"mode": COLD_START if reseeked else WARM_START, "length": self._length, **window.snapshot()}
+        # Returns {"mode": COLD_START if reseeked else WARM_START, "length": self._length,
+        #          "generation": self._generation, **window.snapshot()}
 
-    def get_ref(self, step: int) -> tuple[str, list]:
+    def get_ref(self, step: int, generation: int | None = None) -> tuple[str, list]:
+        # If generation differs from the current one, return "final" only when that retired
+        # generation had a final_step and step >= final_step; otherwise return "superseded".
         # status from window.lookup(step); refs wrapped in a list so Ray returns the ObjectRef itself
         # ("ready", [ref]) / ("pending", []) / ("final", []) / ("evicted", []) / ("error", [traceback_str])
         # "error" takes precedence over pending/final/evicted, but already-produced ready steps are still served.
@@ -250,7 +263,8 @@ class RayReadDataLoader:
     ): ...
         # train (is_val=False): calls actor.register(consumer_id, step, None) here and stores the
         #   response as self.restart_info (mode/length/snapshot) – mirrors CacheResume* doing init in __init__.
-        # val: registration happens in __iter__ with reseek_token=f"val-{self._num_iters}" and step 0.
+        # val: each __iter__ registers step 0; the first registration has no token, later passes
+        #   use reseek_token=f"val-after-gen{self._generation}" to share a pass across siblings.
 
     def set_length(self, length: int) -> None
     def __len__(self) -> int          # self._length if set, else restart_info["length"] (TypeError if unknown)
@@ -303,15 +317,17 @@ class RayCPUNodeConfig(MMAPConfig):
         # 1. validate step is not None and cpu_dataloader_factory is set (ValueError otherwise)
         # 2. import ray lazily; if not ray.is_initialized(): ray.init(address=ray_address,
         #    namespace=ray_namespace, ignore_reinit_error=True)
-        # 3. step = 0 if is_val; if cached_len: cached_len, step = self._adjust_for_epoch_resume(cached_len, step)
-        #    (move _adjust_for_epoch_resume from CacheResumeMMAPConfig to MMAPConfig so both share it)
+        # 3. step = 0 if is_val; for train only, if cached_len:
+        #    cached_len, step = self._adjust_for_epoch_resume(cached_len, step)
         # 4. ps = parallel_state_util.parallel_state; dp_rank = ps.get_data_parallel_rank();
         #    dp_size = ps.get_data_parallel_world_size()
         # 5. actor = get_or_create_prefetch_actor(job_name, split="val" if is_val else "train", ...)
         # 6. dl = RayReadDataLoader(step, actor, consumer_id=dist.get_rank(),
         #        prefetch_length=val_prefetch_length if is_val else prefetch_length, is_val=is_val,
         #        register_timeout_s=register_timeout_s, ...)
-        # 7. dl.set_length(max(cached_len, dl.remote_length() or 0)); log like the existing config; return dl
+        # 7. length = dl.remote_length() or cached_len for val; cached_len for train with a cache;
+        #    otherwise dl.remote_length() or 0. This is the number of batches the consumer will yield.
+        #    Call dl.set_length(length); log like the existing config; return dl.
 ```
 
 `MMAPDataModule` needs no change: it calls `mmap_config.create(...)` with the same signature.
