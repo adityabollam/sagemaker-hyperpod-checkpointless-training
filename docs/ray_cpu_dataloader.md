@@ -52,6 +52,25 @@ Problems this solves:
   training loop never waits on the network in steady state.
 * Batches are kept on CPU (same as today's PDL/CDL); Lightning/Megatron moves them to GPU.
 
+### Consumer leases
+
+`consumer_steps` used to be the only liveness signal, so a consumer id that stopped acking and
+never re-registered (elastic restart, rank remap) froze production at `stale_min + prefetch_length`
+forever. The window therefore keeps a lease per consumer (`last_seen`), refreshed by `register`,
+`ack` and `get_ref(step, consumer_id)` — a rank blocked polling a "pending" step stays live.
+
+* A consumer whose lease is older than `consumer_timeout_s` is excluded from `should_produce`
+  and `evict` (production follows `min(live)` instead of `min(all)`).
+* If *every* consumer is expired, `should_produce`/`evict` fall back to `low_watermark`: production
+  is capped at `low_watermark + prefetch_length` and nothing is evicted, so a rank that comes back
+  still finds its rollback window.
+* Re-registering revives an expired id at the registered step; a train reseek re-registers the
+  known consumers *preserving* their leases, so it does not resurrect expired ids.
+* `consumer_timeout_s` must exceed the longest gap a live rank can go without a `get_ref`/`ack`
+  (e.g. a long validation run or checkpoint save on a sibling rank). `math.inf` disables expiry.
+* Because actors are created with `get_if_exists=True`, an existing actor keeps the timeout it was
+  created with; changing `consumer_timeout_s` only affects newly created actors.
+
 ### Cold start
 
 1. CPU node runs `ray start --head --resources='{"hpct_cpu_dataloader": 1000}'`.
@@ -124,26 +143,36 @@ module never imports ray.
 
 ```python
 class BatchWindow:
-    def __init__(self, lookback_length: int, prefetch_length: int): ...
+    def __init__(self, lookback_length: int, prefetch_length: int,
+                 consumer_timeout_s: float = 300.0,
+                 clock: Callable[[], float] = time.monotonic): ...
+        # consumer_timeout_s <= 0 -> ValueError; math.inf disables expiry.
     refs: "OrderedDict[int, Any]"     # step -> ObjectRef, ascending, contiguous
     producer_step: int | None         # next step the producer will add; None until first reset()
     final_step: int | None            # first step that does not exist (dataset exhausted)
     consumer_steps: dict[int, int]    # consumer_id -> next step that consumer will read
+    last_seen: dict[int, float]       # consumer_id -> clock() of its last register/ack/get_ref
 
-    def reset(self, step: int) -> list:            # clear everything; producer_step = step; returns dropped refs
+    def reset(self, step: int) -> list:            # clear everything (incl. last_seen); producer_step = step; returns dropped refs
     @property
     def low_watermark(self) -> int | None:         # min(refs) if refs else producer_step
     @property
     def high_watermark(self) -> int | None:        # producer_step - 1 (None if producer_step is None)
     def can_resume_from(self, step: int) -> bool:  # producer_step is not None and low_watermark <= step <= producer_step
-    def register_consumer(self, consumer_id: int, step: int) -> None:  # overwrite (NOT max): restarts roll back
-    def ack(self, consumer_id: int, next_step: int) -> list:           # consumer_steps[id] = max(old, next_step); return evict()
+    def register_consumer(self, consumer_id: int, step: int,
+                          last_seen: float | None = None) -> None:
+        # overwrite (NOT max): restarts roll back; last_seen defaults to clock()
+    def touch(self, consumer_id: int) -> None:     # refresh last_seen; unknown ids are ignored
+    def ack(self, consumer_id: int, next_step: int) -> list:
+        # ignore unknown ids; else touch + consumer_steps[id] = max(old, next_step); return evict()
+    def live_consumer_steps(self) -> list[int]:    # steps of consumers with clock() - last_seen <= consumer_timeout_s
     def evict(self) -> list:
-        # if no consumers: evict nothing. else m = min(consumer_steps.values());
+        # if no consumers: evict nothing. live = live_consumer_steps();
+        # m = min(live) if live else low_watermark (no eviction, window frozen for returning ranks);
         # pop refs with step < m - lookback_length; return popped refs
     def should_produce(self) -> bool:
         # producer_step is not None and final_step is None and producer_step < base + prefetch_length,
-        # base = min(consumer_steps.values()) if consumer_steps else low_watermark
+        # base = min(live_consumer_steps()) if any live else low_watermark
     def add(self, step: int, ref) -> None:          # assert step == producer_step; refs[step] = ref; producer_step += 1
     def mark_final(self) -> None:                   # final_step = producer_step
     def lookup(self, step: int) -> tuple[str, Any]:
@@ -176,6 +205,8 @@ class PrefetchActor:
         is_val: bool = False,
         enable_batch_encryption: bool = False,
         poll_interval_s: float = 0.01,
+        consumer_timeout_s: float = 300.0,   # forwarded to BatchWindow (lease expiry)
+        clock: Callable[[], float] = time.monotonic,  # for tests; forwarded to BatchWindow
     ): ...
         # Does NOT build the dataloader; first register() does.
 
@@ -183,13 +214,16 @@ class PrefetchActor:
         # Under lock:
         #   reseek if: window.producer_step is None, or not window.can_resume_from(step),
         #              or (reseek_token is not None and reseek_token != self._last_reseek_token)
-        #   reseek = window.reset(step); bump self._generation; build dataloader via factory at
-        #            target_load_step=step; self._iter = iter(dl); self._length = len(dl) if possible;
+        #   reseek = window.reset(step); re-register the previously known consumers at `step`
+        #            preserving their last_seen leases (a reseek does not revive expired ids);
+        #            bump self._generation; build dataloader via factory at target_load_step=step;
+        #            self._iter = iter(dl); self._length = len(dl) if possible;
         #            clear stored producer error; remember reseek_token; ensure producer thread running.
         #   window.register_consumer(consumer_id, step)
         # Returns {"mode": COLD_START if reseeked else WARM_START, "length": self._length, **window.snapshot()}
 
-    def get_ref(self, step: int) -> tuple[str, list]:
+    def get_ref(self, step: int, consumer_id: int | None = None) -> tuple[str, list]:
+        # if consumer_id is not None: window.touch(consumer_id) (polls refresh the lease)
         # status from window.lookup(step); refs wrapped in a list so Ray returns the ObjectRef itself
         # ("ready", [ref]) / ("pending", []) / ("final", []) / ("evicted", []) / ("error", [traceback_str])
         # "error" takes precedence over pending/final/evicted, but already-produced ready steps are still served.
@@ -222,6 +256,7 @@ def get_or_create_prefetch_actor(
     num_cpus: float = 1.0,
     resources: dict | None = None,   # default {CPU_DATALOADER_RESOURCE: 0.001}
     enable_batch_encryption: bool = False,
+    consumer_timeout_s: float = 300.0,
 ):
     # ray.remote(PrefetchActor).options(name=prefetch_actor_name(...), namespace=namespace,
     #     lifetime="detached", get_if_exists=True, max_concurrency=8, num_cpus=num_cpus,
@@ -257,7 +292,7 @@ class RayReadDataLoader:
     def remote_length(self) -> int | None   # restart_info["length"] (train) or ray.get(actor.length.remote())
     def __iter__(self):
         # (val: register first). Start a fetch thread for steps self._step, self._step+1, ...:
-        #   loop: status, payload = ray.get(actor.get_ref.remote(s), timeout=rpc_timeout_s)
+        #   loop: status, payload = ray.get(actor.get_ref.remote(s, consumer_id), timeout=rpc_timeout_s)
         #     "pending" -> sleep poll_interval_s, retry (check stop event)
         #     "ready"   -> batch = ray.get(payload[0], timeout=rpc_timeout_s); decrypt if encryption;
         #                  queue.put((s, batch)) on a queue.Queue(maxsize=prefetch_length) (put with timeout,
@@ -295,6 +330,7 @@ class RayCPUNodeConfig(MMAPConfig):
     actor_resources: dict | None = None       # None -> {CPU_DATALOADER_RESOURCE: 0.001}
     enable_batch_encryption: bool = False
     register_timeout_s: float = 900.0
+    consumer_timeout_s: float = 300.0   # PrefetchActor consumer lease timeout (see "Consumer leases")
 
     def create(self, dataloader_init_callable, parallel_state_util, step, is_data_loading_rank,
                create_model_parallel_group_callable, name="Train", is_val=False, cached_len=0):
