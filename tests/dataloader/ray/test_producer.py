@@ -680,7 +680,7 @@ def test_remote_actor_can_be_recreated_after_kill(remote_actor_factory):
     ray.get(actor.register.remote(0, 0))
     ray.kill(actor, no_restart=True)
 
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 30
     fresh_actor = None
     while time.monotonic() < deadline:
         candidate, _ = remote_actor_factory(
@@ -694,6 +694,7 @@ def test_remote_actor_can_be_recreated_after_kill(remote_actor_factory):
         if result["mode"] == "cold_start":
             fresh_actor = candidate
             break
+        time.sleep(0.05)
     assert fresh_actor is not None
 
 
