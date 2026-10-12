@@ -700,13 +700,33 @@ class TestRayCPUNodeConfig(unittest.TestCase):
         self.read_dl.set_length.assert_called_once_with(50)
 
     @patch("hyperpod_checkpointless_training.dataloader.config.get_num_microbatches", return_value=2)
-    def test_create_cached_len_after_epoch_uses_max_with_remote_length(self, mock_num_mbs):
+    def test_create_cached_len_uses_remaining_not_remote_length(self, mock_num_mbs):
         self.read_dl.remote_length.return_value = 200
         self._create(step=100, cached_len=150)
 
         # batch_in_epoch = (100 * 2) % 150 = 50, remaining = 100 < remote_length 200
         self.assertEqual(self.fake_read_dataloader.RayReadDataLoader.call_args.args[0], 50)
-        self.read_dl.set_length.assert_called_once_with(200)
+        self.read_dl.set_length.assert_called_once_with(100)
+
+    @patch("hyperpod_checkpointless_training.dataloader.config.get_num_microbatches", return_value=2)
+    def test_create_val_cached_len_uses_remote_length_without_epoch_adjustment(
+        self, mock_num_mbs
+    ):
+        self.read_dl.remote_length.return_value = 30
+        with patch.object(self.config, "_adjust_for_epoch_resume") as adjust:
+            self._create(step=7, cached_len=99, is_val=True)
+
+        adjust.assert_not_called()
+        mock_num_mbs.assert_not_called()
+        self.assertEqual(self.fake_read_dataloader.RayReadDataLoader.call_args.args[0], 0)
+        self.read_dl.set_length.assert_called_once_with(30)
+
+    def test_create_val_uses_cached_length_when_remote_length_is_unknown(self):
+        self.read_dl.remote_length.return_value = None
+        self._create(step=7, cached_len=30, is_val=True)
+
+        self.assertEqual(self.fake_read_dataloader.RayReadDataLoader.call_args.args[0], 0)
+        self.read_dl.set_length.assert_called_once_with(30)
 
     def test_adjust_for_epoch_resume_shared_with_cache_resume_config(self):
         self.assertIs(
