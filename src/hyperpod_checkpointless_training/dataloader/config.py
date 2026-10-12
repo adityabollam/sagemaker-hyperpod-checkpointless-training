@@ -176,6 +176,7 @@ class RayCPUNodeConfig(MMAPConfig):
     actor_resources: dict | None = None
     enable_batch_encryption: bool = False
     register_timeout_s: float = 900.0
+    consumer_timeout_s: float = 300.0
 
     def create(
         self,
@@ -253,6 +254,7 @@ class RayCPUNodeConfig(MMAPConfig):
             num_cpus=self.actor_num_cpus,
             resources=self.actor_resources,
             enable_batch_encryption=self.enable_batch_encryption,
+            consumer_timeout_s=self.consumer_timeout_s,
         )
 
         data_loader = RayReadDataLoader(

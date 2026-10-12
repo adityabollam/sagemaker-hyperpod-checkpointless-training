@@ -184,6 +184,8 @@ def actor_factory(monkeypatch):
             is_val=kwargs.pop("is_val", False),
             enable_batch_encryption=kwargs.pop("enable_batch_encryption", False),
             poll_interval_s=kwargs.pop("poll_interval_s", 0.005),
+            consumer_timeout_s=kwargs.pop("consumer_timeout_s", 300.0),
+            clock=kwargs.pop("clock", time.monotonic),
         )
         assert not kwargs
         actors.append(actor)
@@ -345,6 +347,72 @@ def test_train_out_of_window_reseek_resets_sibling_consumers(actor_factory):
 
     assert result["mode"] == "cold_start"
     assert actor._window.consumer_steps == {"A": 20, "B": 20}
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def test_expired_consumer_does_not_block_production(actor_factory):
+    clock = FakeClock()
+    actor = actor_factory(
+        StepFactory(50),
+        lookback_length=1,
+        prefetch_length=3,
+        consumer_timeout_s=10.0,
+        clock=clock,
+    )
+    registration_a = actor.register("A", 0)
+    actor.register("B", 0)
+    assert wait_until(lambda: actor.stats()["producer_step"] == 3)
+
+    # B polls get_ref (refreshing its lease); production stays capped at B's step.
+    for _ in range(3):
+        clock.advance(6)
+        assert actor.get_ref(0, consumer_id="B")[0] == "ready"
+        actor.ack("A", 3, registration_a["registration_id"])
+
+    time.sleep(0.1)
+    assert actor.stats()["producer_step"] == 3
+
+    # B stops polling and its lease expires; production now follows A alone.
+    clock.advance(11)
+    actor.ack("A", 3, registration_a["registration_id"])
+    assert wait_until(lambda: actor.stats()["producer_step"] == 6)
+
+    # Positional get_ref still works and unknown consumer ids add nothing.
+    assert actor.get_ref(0)[0] in ("ready", "evicted")
+    consumers_before = dict(actor._window.consumer_steps)
+    actor.get_ref(0, consumer_id="unknown")
+    assert actor._window.consumer_steps == consumers_before
+
+
+def test_reseek_does_not_revive_expired_consumer(actor_factory):
+    clock = FakeClock()
+    actor = actor_factory(
+        StepFactory(50),
+        lookback_length=1,
+        prefetch_length=3,
+        consumer_timeout_s=10.0,
+        clock=clock,
+    )
+    actor.register("A", 0)
+    actor.register("B", 0)
+    assert wait_until(lambda: actor.stats()["producer_step"] == 3)
+
+    clock.advance(11)
+    result = actor.register("A", 40)
+
+    assert result["mode"] == "cold_start"
+    assert actor._window.consumer_steps == {"A": 40, "B": 40}
+    assert actor._window.live_consumer_steps() == [40]
 
 
 def test_backpressure_ack_and_eviction(actor_factory):
@@ -667,4 +735,5 @@ def test_actor_factory_sets_default_resources(monkeypatch):
         "prefetch_length": 5,
         "is_val": True,
         "enable_batch_encryption": False,
+        "consumer_timeout_s": 300.0,
     }

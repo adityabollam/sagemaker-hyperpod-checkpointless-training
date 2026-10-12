@@ -631,6 +631,7 @@ class TestRayCPUNodeConfig(unittest.TestCase):
             num_cpus=2.0,
             resources=None,
             enable_batch_encryption=False,
+            consumer_timeout_s=300.0,
         )
         self.fake_read_dataloader.RayReadDataLoader.assert_called_once_with(
             100,
@@ -653,12 +654,14 @@ class TestRayCPUNodeConfig(unittest.TestCase):
             actor_resources={"custom": 1},
             enable_batch_encryption=True,
             register_timeout_s=5.0,
+            consumer_timeout_s=42.0,
         )
         self._create(config=config)
 
         actor_kwargs = self.fake_producer.get_or_create_prefetch_actor.call_args.kwargs
         self.assertEqual(actor_kwargs["resources"], {"custom": 1})
         self.assertTrue(actor_kwargs["enable_batch_encryption"])
+        self.assertEqual(actor_kwargs["consumer_timeout_s"], 42.0)
         self.assertEqual(actor_kwargs["job_name"], "default")
         self.assertEqual(actor_kwargs["namespace"], "hyperpod_checkpointless")
         self.assertTrue(self.fake_read_dataloader.RayReadDataLoader.call_args.kwargs["enable_batch_encryption"])

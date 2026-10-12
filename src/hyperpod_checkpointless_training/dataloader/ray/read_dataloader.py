@@ -69,7 +69,7 @@ class RayReadDataLoader:
     queue; the training loop pops batches from that queue in order.
 
     fetch_thread:
-    actor.get_ref(s) -> ray.get(ref) -> [decrypt] -> queue [(s, batch), ...]
+    actor.get_ref(s, consumer_id) -> ray.get(ref) -> [decrypt] -> queue [(s, batch), ...]
 
     Main thread:
     queue -> yield batch -> step += 1 -> actor.ack(consumer_id, step, registration_id)
@@ -297,7 +297,8 @@ class RayReadDataLoader:
         try:
             while not state.stop_event.is_set():
                 status, payload = self._rpc_get(
-                    self._actor.get_ref.remote(step), state.stop_event
+                    self._actor.get_ref.remote(step, self._consumer_id),
+                    state.stop_event,
                 )
                 if status == "pending":
                     state.stop_event.wait(self._poll_interval_s)
