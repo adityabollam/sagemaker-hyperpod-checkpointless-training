@@ -28,6 +28,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from hyperpod_checkpointless_training.dataloader import utils as dlu
+
 ray = pytest.importorskip("ray")
 
 config_module = importlib.import_module(
@@ -287,7 +289,7 @@ def test_actor_loss_recreates_and_resumes_from_checkpoint(e2e):
     while time.monotonic() < deadline:
         try:
             batch = next_with_deadline(iterator, deadline - time.monotonic())
-        except (RuntimeError, ray.exceptions.RayError):
+        except dlu.DataLoaderFatalError:
             break
         assert_batch(batch, expected_step)
         before_kill[expected_step] = batch
@@ -400,7 +402,7 @@ def test_producer_error_preserves_already_produced_steps(e2e):
 
     for step in range(3):
         assert_batch(next(iterator), step)
-    with pytest.raises(RuntimeError, match="boom at step 3"):
+    with pytest.raises(dlu.DataLoaderFatalError, match="boom at step 3"):
         next(iterator)
 
 

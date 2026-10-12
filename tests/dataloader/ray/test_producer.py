@@ -287,7 +287,8 @@ def test_validation_reseek_preserves_sibling_consumers(actor_factory):
     factory = StepFactory(12)
     actor = actor_factory(factory, is_val=True, lookback_length=2, prefetch_length=10)
 
-    assert actor.register("A", 0, "val-0")["mode"] == "cold_start"
+    registration_a = actor.register("A", 0, "val-0")
+    assert registration_a["mode"] == "cold_start"
     assert actor.register("B", 0, "val-0")["mode"] == "warm_start"
     factory_calls = len(factory.calls)
     result = actor.register("A", 0, "val-1")
@@ -297,8 +298,8 @@ def test_validation_reseek_preserves_sibling_consumers(actor_factory):
     assert actor._window.consumer_steps == {"A": 0, "B": 0}
     assert wait_until(lambda: actor.stats()["producer_step"] >= 5)
 
-    actor.ack("A", 4)
-    actor.ack("A", 5)
+    actor.ack("A", 4, registration_a["registration_id"])
+    actor.ack("A", 5, registration_a["registration_id"])
 
     assert actor.get_ref(0)[0] == "ready"
     assert actor.register("B", 0, "val-1")["mode"] == "warm_start"
@@ -321,15 +322,34 @@ def test_train_out_of_window_reseek_resets_sibling_consumers(actor_factory):
 def test_backpressure_ack_and_eviction(actor_factory):
     factory = StepFactory(20)
     actor = actor_factory(factory, lookback_length=1, prefetch_length=3)
-    actor.register(1, 0)
+    registration = actor.register(1, 0)
     assert wait_until(lambda: actor.stats()["producer_step"] == 3)
     time.sleep(0.1)
     assert actor.stats()["producer_step"] == 3
 
-    actor.ack(1, 3)
+    actor.ack(1, 3, registration["registration_id"])
 
     assert wait_until(lambda: actor.stats()["producer_step"] == 6)
     assert actor.stats()["low_watermark"] == 2
+
+
+def test_ack_from_previous_registration_does_not_evict_window(actor_factory):
+    actor = actor_factory(StepFactory(120), lookback_length=2, prefetch_length=30)
+    actor.register("A", 88)
+    assert wait_until(lambda: actor.stats()["producer_step"] >= 118)
+
+    old_registration = actor.register("A", 100)
+    new_registration = actor.register("A", 90)
+
+    assert old_registration["registration_id"] != new_registration["registration_id"]
+    actor.ack("A", 101, old_registration["registration_id"])
+
+    assert actor._window.consumer_steps["A"] == 90
+    assert [actor.get_ref(step)[0] for step in range(88, 91)] == [
+        "ready",
+        "ready",
+        "ready",
+    ]
 
 
 def test_ready_refs_and_exhaustion(actor_factory):

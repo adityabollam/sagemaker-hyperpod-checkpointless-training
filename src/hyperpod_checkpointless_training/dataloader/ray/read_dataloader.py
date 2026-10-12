@@ -26,9 +26,19 @@ from ray.exceptions import GetTimeoutError
 
 # First Party
 import hyperpod_checkpointless_training.dataloader.encryption.encryption_manager as encryption_manager
+from hyperpod_checkpointless_training.dataloader import utils as dlu
 from hyperpod_checkpointless_training.inprocess.logger import get_logger
 
 KMSEncryptionManager = encryption_manager.KMSEncryptionManager
+_FATAL_RAY_ERRORS = (
+    ray.exceptions.RayActorError,
+    ray.exceptions.ObjectLostError,
+    GetTimeoutError,
+) + tuple(
+    getattr(ray.exceptions, name)
+    for name in ("ActorDiedError", "ActorUnavailableError")
+    if hasattr(ray.exceptions, name)
+)
 
 # How often blocking loops wake up to re-check the stop event.
 _STOP_CHECK_INTERVAL_S = 0.1
@@ -62,7 +72,8 @@ class RayReadDataLoader:
     actor.get_ref(s) -> ray.get(ref) -> [decrypt] -> queue [(s, batch), ...]
 
     Main thread:
-    queue -> yield batch -> step += 1 -> actor.ack(consumer_id, step) (fire-and-forget)
+    queue -> yield batch -> step += 1 -> actor.ack(consumer_id, step, registration_id)
+        (fire-and-forget)
 
     If ``stop()`` is called while an iteration is in progress, the iterator raises
     ``RuntimeError`` on its next ``__next__`` (rather than ending cleanly) so the
@@ -110,6 +121,7 @@ class RayReadDataLoader:
         self._length = None
         self._num_iters = 0
         self._encryption_manager = None
+        self._registration_id = None
         self._state = None
         self._state_lock = threading.Lock()
         self.restart_info = None
@@ -140,17 +152,30 @@ class RayReadDataLoader:
         """Length reported by the producer actor (``len`` of the CPU-node dataloader)."""
         if not self._is_val and self.restart_info is not None:
             return self.restart_info.get("length")
-        return ray.get(self._actor.length.remote(), timeout=self._register_timeout_s)
+        try:
+            return ray.get(
+                self._actor.length.remote(), timeout=self._register_timeout_s
+            )
+        except _FATAL_RAY_ERRORS as e:
+            raise dlu.DataLoaderFatalError(
+                f"[{self._consumer_id}] Failed to read dataloader length: {e}"
+            ) from e
 
     def _register(self, step: int, reseek_token: str | None) -> dict:
-        info = ray.get(
-            self._actor.register.remote(self._consumer_id, step, reseek_token),
-            timeout=self._register_timeout_s,
-        )
+        try:
+            info = ray.get(
+                self._actor.register.remote(self._consumer_id, step, reseek_token),
+                timeout=self._register_timeout_s,
+            )
+        except _FATAL_RAY_ERRORS as e:
+            raise dlu.DataLoaderFatalError(
+                f"[{self._consumer_id}] Failed to register at step {step}: {e}"
+            ) from e
         self._logger.info(
             f"[{self._consumer_id}] Registered with prefetch actor at step={step} "
             f"reseek_token={reseek_token}: {info}"
         )
+        self._registration_id = info["registration_id"]
         return info
 
     def _get_encryption_manager(self):
@@ -190,6 +215,11 @@ class RayReadDataLoader:
                         f"[{self._consumer_id}] Reached final step {self._step}."
                     )
                     return
+                if isinstance(item, _FATAL_RAY_ERRORS):
+                    raise dlu.DataLoaderFatalError(
+                        f"[{self._consumer_id}] Ray dataloader failed at step "
+                        f"{self._step}: {item}"
+                    ) from item
                 if isinstance(item, BaseException):
                     raise item
                 step, batch = item
@@ -232,7 +262,7 @@ class RayReadDataLoader:
 
     def _ack(self) -> None:
         try:
-            self._actor.ack.remote(self._consumer_id, self._step)
+            self._actor.ack.remote(self._consumer_id, self._step, self._registration_id)
         except Exception as e:
             self._logger.warning(
                 f"[{self._consumer_id}] Failed to ack step {self._step}: {e}"
@@ -290,7 +320,7 @@ class RayReadDataLoader:
                     )
                 elif status == "error":
                     detail = payload[0] if payload else "<no traceback>"
-                    raise RuntimeError(
+                    raise dlu.DataLoaderFatalError(
                         f"[{self._consumer_id}] Prefetch actor failed to produce step "
                         f"{step}:\n{detail}"
                     )

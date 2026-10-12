@@ -25,6 +25,7 @@ ray = pytest.importorskip("ray")
 import hyperpod_checkpointless_training.dataloader.ray.read_dataloader as rdl  # noqa: E402
 
 RayReadDataLoader = rdl.RayReadDataLoader
+DataLoaderFatalError = rdl.dlu.DataLoaderFatalError
 
 MODULE = "hyperpod_checkpointless_training.dataloader.ray.read_dataloader"
 
@@ -65,15 +66,21 @@ class StubPrefetchActor:
         self.polls = 0
         self.registrations = []
         self.acks = []
+        self.registration_counter = 0
+        self.consumer_registration_ids = {}
 
     def register(self, consumer_id, step, reseek_token=None):
         if self.register_delay_s:
             time.sleep(self.register_delay_s)
+        self.registration_counter += 1
+        registration_id = self.registration_counter
+        self.consumer_registration_ids[consumer_id] = registration_id
         self.registrations.append((consumer_id, step, reseek_token))
         return {
             "mode": "warm_start" if step else "cold_start",
             "length": self._length,
             "producer_step": step,
+            "registration_id": registration_id,
         }
 
     def get_ref(self, step):
@@ -92,8 +99,8 @@ class StubPrefetchActor:
             self.refs[step] = ray.put(self.payload_fn(step))
         return "ready", [self.refs[step]]
 
-    def ack(self, consumer_id, next_step):
-        self.acks.append((consumer_id, next_step))
+    def ack(self, consumer_id, next_step, registration_id):
+        self.acks.append((consumer_id, next_step, registration_id))
 
     def length(self):
         if self.length_delay_s:
@@ -171,7 +178,7 @@ def test_error_raises_with_producer_traceback():
     dl = _make(actor)
     it = iter(dl)
     assert next(it)["step"] == 0
-    with pytest.raises(RuntimeError, match="boom"):
+    with pytest.raises(DataLoaderFatalError, match="boom"):
         next(it)
 
 
@@ -182,8 +189,9 @@ def test_rpc_timeout_is_raised_in_main_thread():
     )  # wait for actor startup before using a short timeout
     dl = _make(actor, rpc_timeout_s=0.3)
     start = time.monotonic()
-    with pytest.raises(ray.exceptions.GetTimeoutError):
+    with pytest.raises(DataLoaderFatalError) as exc_info:
         next(iter(dl))
+    assert isinstance(exc_info.value.__cause__, ray.exceptions.GetTimeoutError)
     assert time.monotonic() - start < 1.5
 
 
@@ -197,8 +205,9 @@ def test_register_timeout_allows_slow_initial_registration():
 def test_register_timeout_is_applied_to_initial_registration():
     actor = StubPrefetchActor.remote(final_step=3, length=3, register_delay_s=1.5)
 
-    with pytest.raises(ray.exceptions.GetTimeoutError):
+    with pytest.raises(DataLoaderFatalError) as exc_info:
         _make(actor, rpc_timeout_s=0.5, register_timeout_s=0.3)
+    assert isinstance(exc_info.value.__cause__, ray.exceptions.GetTimeoutError)
 
 
 def test_val_length_uses_register_timeout():
@@ -251,7 +260,7 @@ def test_acks_reach_actor():
     dl = _make(actor, step=10)
     assert [b["step"] for b in dl] == [10, 11, 12]
     acks = _wait_for(
-        lambda: ray.get(actor.get_acks.remote()) == [(3, 11), (3, 12), (3, 13)]
+        lambda: ray.get(actor.get_acks.remote()) == [(3, 11, 1), (3, 12, 1), (3, 13, 1)]
     )
     assert acks, ray.get(actor.get_acks.remote())
 

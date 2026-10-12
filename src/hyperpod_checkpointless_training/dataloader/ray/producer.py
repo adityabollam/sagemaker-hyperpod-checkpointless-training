@@ -73,6 +73,8 @@ class PrefetchActor:
         self._prebuilt = None
         self._error: tuple[int, str] | None = None
         self._last_reseek_token = None
+        self._registration_counter = 0
+        self._consumer_registration_ids: dict[int, int] = {}
         self._stop_event = threading.Event()
         self._wakeup = threading.Event()
         self._producer_thread = None
@@ -83,6 +85,9 @@ class PrefetchActor:
         self, consumer_id: int, step: int, reseek_token: str | None = None
     ) -> dict:
         with self._lock:
+            self._registration_counter += 1
+            registration_id = self._registration_counter
+            self._consumer_registration_ids[consumer_id] = registration_id
             reason = None
             if self._error is not None and self._error[0] == self._generation:
                 reason = "producer_error"
@@ -142,7 +147,12 @@ class PrefetchActor:
             self._window.register_consumer(consumer_id, step)
             self._wakeup.set()
             mode = COLD_START if reason is not None else WARM_START
-            return {"mode": mode, "length": self._length, **self._window.snapshot()}
+            return {
+                "mode": mode,
+                "length": self._length,
+                "registration_id": registration_id,
+                **self._window.snapshot(),
+            }
 
     def _ensure_producer_thread(self) -> None:
         if self._stop_event.is_set():
@@ -164,8 +174,10 @@ class PrefetchActor:
                 return "error", [self._error[1]]
             return status, []
 
-    def ack(self, consumer_id: int, next_step: int) -> None:
+    def ack(self, consumer_id: int, next_step: int, registration_id: int) -> None:
         with self._lock:
+            if self._consumer_registration_ids.get(consumer_id) != registration_id:
+                return
             evicted = self._window.ack(consumer_id, next_step)
             del evicted
             self._wakeup.set()
