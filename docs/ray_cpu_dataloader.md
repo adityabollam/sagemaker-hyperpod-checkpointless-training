@@ -323,8 +323,44 @@ class RayCPUNodeConfig(MMAPConfig):
   num_replicas=dp_size)` + `SkipDataLoader(_skip_batches=target_load_step, num_workers=N)` on the
   CPU node, mirroring `examples/dataloader/data_module.py::train_dataloader/val_dataloader`.
 * `examples/llama3/launch/ray_cpu_dataloader_head.yaml` – CPU-instance pod running the Ray head with
-  the `hpct_cpu_dataloader` resource + a Service exposing 6379/8265/10001.
+  the `hpct_cpu_dataloader` resource + a ClusterIP Service exposing 6379/8265/10001 + a NetworkPolicy restricting ingress to the Ray ports (see Security below).
 * README section "Dedicated CPU-node dataloading with Ray".
+
+### Security
+
+Ray has no authentication by default: any process that can reach the head's GCS, dashboard (Jobs
+API) or Ray Client port can run arbitrary code on the CPU node.
+
+* Ports are pinned in `ray start` on both the head and the GPU nodes so they can be firewalled
+  (all other Ray ports default to random values):
+
+  | Port | Purpose | Head ingress from GPU nodes | GPU-node ingress from head / other GPU nodes |
+  |------|---------|-----------------------------|----------------------------------------------|
+  | 6379 | GCS (head only) | yes | – |
+  | 6380 | node manager (raylet) | yes | yes |
+  | 6381 | object manager | yes | yes |
+  | 6382 | runtime env agent | local only | local only |
+  | 6383, 6384 | dashboard agent gRPC / HTTP | local only | yes (head dashboard) |
+  | 6385 | metrics export | Prometheus only | Prometheus only |
+  | 8265 | dashboard / Jobs API (head only) | yes | – |
+  | 10001 | Ray Client (head only) | yes | – |
+  | 10002-19999 | worker processes (actors, drivers) | yes | yes |
+
+* The head manifest's NetworkPolicy admits only pods labelled `hpct-ray-client: "true"` in the same
+  namespace (cross-namespace `namespaceSelector` example commented in the file). Only trusted
+  training pods should get that label.
+* The example training manifests use `hostNetwork: True`. NetworkPolicy does not apply to
+  host-network pods and `podSelector`s do not match them (their traffic comes from the node IP), so:
+  enable the commented `ipBlock` rule for the GPU node subnet on the head policy, and protect the GPU
+  nodes' Ray ports above with security groups (allow only the CPU node and the other GPU nodes).
+  The manifests set `net.ipv4.ip_local_port_range="20000 65535"`, so the pinned ports do not collide
+  with ephemeral ports. If the training pods are not host-network and are already isolated by a
+  NetworkPolicy, add an ingress rule from the head pod and from `hpct-ray-client: "true"` pods on the
+  GPU-node ports above.
+* Keep the Service as `ClusterIP`; never expose the dashboard or Ray Client through an Ingress,
+  `LoadBalancer` or `NodePort` (use `kubectl port-forward`).
+* NetworkPolicy needs a CNI that enforces it (Amazon VPC CNI with network policy enabled, Calico,
+  Cilium); otherwise it is silently ignored.
 
 ## Tests
 

@@ -24,14 +24,23 @@
 # object store (batches are pulled once per GPU node). In the training job's container args
 # (e.g. pretrain_llama3_70b_checkpointless_p5.yaml), before hyperpodrun/torchrun:
 #
-#   ray start --address=hpct-ray-cpu-dataloader-head:6379 --num-cpus=0 --block & \
+#   ray start --address=hpct-ray-cpu-dataloader-head:6379 --num-cpus=0 \
+#     --node-manager-port=6380 --object-manager-port=6381 --runtime-env-agent-port=6382 \
+#     --dashboard-agent-grpc-port=6383 --dashboard-agent-listen-port=6384 \
+#     --metrics-export-port=6385 --min-worker-port=10002 --max-worker-port=19999 --block & \
 #   until ray status --address=hpct-ray-cpu-dataloader-head:6379 >/dev/null 2>&1; do sleep 1; done && \
 #   hyperpodrun ...
 #
 # and keep RayCPUNodeConfig(ray_address="auto") (the default) so training processes attach to the
 # local raylet. Ray connects pods directly by pod IP for object transfer; the Service below is only
-# used for head discovery (6379), the dashboard (8265) and Ray Client (10001). Make sure network
-# policies allow pod-to-pod traffic between the GPU pods and this pod on Ray's ports.
+# used for head discovery (6379), the dashboard (8265) and Ray Client (10001).
+#
+# Security: Ray has no authentication, so the NetworkPolicy at the end of this file only admits pods
+# labelled hpct-ray-client: "true" (add it to the training job's pod template metadata.labels) on the
+# Ray ports pinned above. The example training manifests use hostNetwork: True, which podSelectors do
+# not match; for those, enable the ipBlock rule with your GPU node subnet. The GPU nodes' own Ray ports
+# (6380-6385, 10002-19999) must be reachable from this pod. See "Security" in
+# docs/ray_cpu_dataloader.md.
 #
 # Ray version (ray[default]>=2.40,<3) and Python version must match between the head and GPU pods.
 
@@ -64,6 +73,10 @@ spec:
               containerPort: 8265
             - name: client
               containerPort: 10001
+            - name: node-manager
+              containerPort: 6380
+            - name: object-manager
+              containerPort: 6381
           env:
             - name: RAY_NUM_CPUS
               value: "70"  # leave a few of the instance's vCPUs for the raylet/OS
@@ -75,6 +88,14 @@ spec:
                 --port=6379 \
                 --dashboard-host=0.0.0.0 \
                 --ray-client-server-port=10001 \
+                --node-manager-port=6380 \
+                --object-manager-port=6381 \
+                --runtime-env-agent-port=6382 \
+                --dashboard-agent-grpc-port=6383 \
+                --dashboard-agent-listen-port=6384 \
+                --metrics-export-port=6385 \
+                --min-worker-port=10002 \
+                --max-worker-port=19999 \
                 --num-cpus="${RAY_NUM_CPUS}" \
                 --resources='{"hpct_cpu_dataloader": 1000}' \
                 --block
@@ -120,3 +141,63 @@ spec:
     - name: client
       port: 10001
       targetPort: 10001
+---
+# Ray has no authentication by default: anything that can reach these ports can run arbitrary code on
+# the CPU node. Only enforced if the cluster's CNI enforces NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hpct-ray-cpu-dataloader-head
+  labels:
+    app.kubernetes.io/name: hpct-ray-cpu-dataloader-head
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hpct-ray-cpu-dataloader-head
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Trusted Ray clients (the GPU training pods) in this namespace.
+        - podSelector:
+            matchLabels:
+              hpct-ray-client: "true"
+        # Training pods in another namespace: namespaceSelector and podSelector in ONE entry (both
+        # must match). As two separate entries, every pod in that namespace would be allowed.
+        # - namespaceSelector:
+        #     matchLabels:
+        #       kubernetes.io/metadata.name: <training-namespace>
+        #   podSelector:
+        #     matchLabels:
+        #       hpct-ray-client: "true"
+        # hostNetwork training pods connect from their node IP and are not matched by podSelector.
+        # Allow the GPU nodes' subnet instead (this admits every address in the range).
+        # - ipBlock:
+        #     cidr: 10.0.0.0/16  # placeholder: GPU node subnet
+      ports:
+        - protocol: TCP
+          port: 6379  # GCS
+        - protocol: TCP
+          port: 6380  # node manager (raylet)
+        - protocol: TCP
+          port: 6381  # object manager
+        - protocol: TCP
+          port: 8265  # dashboard / Jobs API
+        - protocol: TCP
+          port: 10001  # Ray Client
+        - protocol: TCP
+          port: 10002  # worker ports (PrefetchActor processes)
+          endPort: 19999
+    # The head reaching its own pod IP (Ray binds its agents to the pod IP).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: hpct-ray-cpu-dataloader-head
+    # Prometheus scraping Ray metrics: uncomment and set your monitoring namespace.
+    # - from:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: <monitoring-namespace>
+    #   ports:
+    #     - protocol: TCP
+    #       port: 6385

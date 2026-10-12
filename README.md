@@ -70,15 +70,28 @@ pip install .[ray]   # ray[default]>=2.40,<3
 
 ### Cluster setup
 
-1. Deploy the Ray head on a CPU instance: [examples/llama3/launch/ray_cpu_dataloader_head.yaml](examples/llama3/launch/ray_cpu_dataloader_head.yaml) (set the image to your training image and the `nodeSelector` to your CPU instance type). It runs `ray start --head ... --resources='{"hpct_cpu_dataloader": 1000}'` and exposes it through the `hpct-ray-cpu-dataloader-head` Service.
+1. Deploy the Ray head on a CPU instance: [examples/llama3/launch/ray_cpu_dataloader_head.yaml](examples/llama3/launch/ray_cpu_dataloader_head.yaml) (set the image to your training image and the `nodeSelector` to your CPU instance type). It runs `ray start --head ... --resources='{"hpct_cpu_dataloader": 1000}'` and exposes it through the `hpct-ray-cpu-dataloader-head` Service. The manifest also contains a `NetworkPolicy` that restricts the head's Ray ports to pods labelled `hpct-ray-client: "true"` (see [Security](#security)).
 2. In the training job, join each GPU pod to the Ray cluster before launching training:
 
    ```bash
-   ray start --address=hpct-ray-cpu-dataloader-head:6379 --num-cpus=0 --block &
+   ray start --address=hpct-ray-cpu-dataloader-head:6379 --num-cpus=0 \
+     --node-manager-port=6380 --object-manager-port=6381 --runtime-env-agent-port=6382 \
+     --dashboard-agent-grpc-port=6383 --dashboard-agent-listen-port=6384 \
+     --metrics-export-port=6385 --min-worker-port=10002 --max-worker-port=19999 --block &
    # wait for the raylet, then: hyperpodrun ... / torchrun ...
    ```
 
    Training processes connect with `ray_address="auto"` (the default).
+   Add the label `hpct-ray-client: "true"` to the training job's pod template (`metadata.labels`).
+
+### Security
+
+Ray has no authentication by default: anything that can reach the Ray head's ports can submit work and run arbitrary code on the CPU node.
+
+- The head manifest's `NetworkPolicy` only admits pods labelled `hpct-ray-client: "true"` in the same namespace (a cross-namespace `namespaceSelector` example is commented in the file) on the Ray ports: GCS 6379, raylet 6380/6381, dashboard 8265, Ray Client 10001 and workers 10002-19999. Give that label only to trusted training pods.
+- The example training manifests use `hostNetwork: True`. NetworkPolicy `podSelector`s do not match host-network pods, so for those enable the commented `ipBlock` rule with your GPU node subnet, and restrict the GPU nodes' Ray ports (6380-6385, 10002-19999) with security groups.
+- Keep the Service as `ClusterIP`. Do not expose the dashboard or Ray Client through an Ingress, a `LoadBalancer` or a `NodePort`; use `kubectl port-forward` to reach the dashboard.
+- NetworkPolicy is only enforced if the cluster's CNI enforces it (for example the Amazon VPC CNI with network policy enabled, Calico or Cilium). Otherwise it is silently ignored.
 
 ### Configuration
 
