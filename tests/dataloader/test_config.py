@@ -82,13 +82,14 @@ class TestCacheResumeMMAPConfig(unittest.TestCase):
         self.config.create(
             self.mock_dataloader_init,
             self.mock_parallel_state_util,
-            100,
+            0,
             self.mock_is_data_loading_rank,
             self.mock_create_model_parallel_group,
             is_val=False,
         )
 
         mock_prefetched_loader.assert_called_once()
+        self.mock_dataloader_init.assert_not_called()
 
     @patch("torch.distributed.get_rank")
     def test_create_method_missing_data_step(self, mock_get_rank):
@@ -141,7 +142,7 @@ class TestCacheResumeMMAPConfig(unittest.TestCase):
         self.config.create(
             self.mock_dataloader_init,
             self.mock_parallel_state_util,
-            100,
+            0,
             self.mock_is_data_loading_rank,
             self.mock_create_model_parallel_group,
             is_val=False,
@@ -150,13 +151,14 @@ class TestCacheResumeMMAPConfig(unittest.TestCase):
         mock_read_loader.assert_called_once_with(
             dataloader_init_callable=self.mock_dataloader_init,
             model_parallel_group=self.mock_create_model_parallel_group.return_value,
-            step=100,
+            step=0,
             prefetch_length=5,
             parallel_state_util=self.mock_parallel_state_util,
             force_cold_start=False,
             cache_dir=os.path.join(self.cache_dir, "train"),
             enable_batch_encryption=False,
         )
+        self.mock_dataloader_init.assert_not_called()
 
     @patch("torch.distributed.all_reduce")
     @patch("torch.tensor")
@@ -306,26 +308,40 @@ class TestCacheResumeMMAPConfigWithLengthSetting(unittest.TestCase):
         mock_parallel_state_util.parallel_state.get_tensor_model_parallel_group.return_value = mock_tp_group
 
         mock_dataloader_callable = Mock()
+        probe_dataloader = Mock()
+        probe_dataloader.__len__ = Mock(return_value=100)
+        mock_dataloader_callable.return_value = probe_dataloader
         mock_is_data_loading_rank = Mock(return_value=True)
         mock_create_model_parallel_group_callable = Mock()
 
-        result = self.config.create(
-            mock_dataloader_callable,
-            mock_parallel_state_util,
-            100,
-            mock_is_data_loading_rank,
-            mock_create_model_parallel_group_callable,
-            cached_len=0,
-        )
+        with patch(
+            "hyperpod_checkpointless_training.dataloader.config.get_num_microbatches",
+            return_value=4,
+        ):
+            result = self.config.create(
+                mock_dataloader_callable,
+                mock_parallel_state_util,
+                30,
+                mock_is_data_loading_rank,
+                mock_create_model_parallel_group_callable,
+                cached_len=0,
+            )
 
         # Verify the dataloader was created and length was set
         self.assertEqual(result, mock_pdl_instance)
         mock_pdl_instance.initialize_data_loader.assert_called_once()
-        mock_pdl_instance.set_length.assert_called_once_with(100)
+        self.assertEqual(mock_pdl_class.call_args.kwargs["step"], 20)
+        mock_pdl_instance.set_length.assert_called_once_with(80)
+        self.assertEqual(mock_pdl_instance.epoch_length, 100)
+        mock_dataloader_callable.assert_called_once_with(target_load_step=0)
         
-        # Verify tensor operations for length synchronization
+        # The full epoch length is probed and reduced once before loader creation.
         mock_tensor.assert_called_once_with(100, dtype=torch.long, device='cuda')
-        mock_all_reduce.assert_called_once()
+        mock_all_reduce.assert_called_once_with(
+            mock_length_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=mock_tp_group,
+        )
 
     @patch("torch.distributed.all_reduce")
     @patch("torch.tensor")
@@ -346,7 +362,7 @@ class TestCacheResumeMMAPConfigWithLengthSetting(unittest.TestCase):
 
         # Mock tensor operations for length synchronization
         mock_length_tensor = Mock()
-        mock_length_tensor.item.return_value = 75
+        mock_length_tensor.item.return_value = 100
         mock_tensor.return_value = mock_length_tensor
 
         # Mock parallel state
@@ -358,22 +374,33 @@ class TestCacheResumeMMAPConfigWithLengthSetting(unittest.TestCase):
         mock_is_data_loading_rank = Mock(return_value=False)
         mock_create_model_parallel_group_callable = Mock()
 
-        result = self.config.create(
-            mock_dataloader_callable,
-            mock_parallel_state_util,
-            100,
-            mock_is_data_loading_rank,
-            mock_create_model_parallel_group_callable,
-            cached_len=0,
-        )
+        with patch(
+            "hyperpod_checkpointless_training.dataloader.config.get_num_microbatches",
+            return_value=4,
+        ):
+            result = self.config.create(
+                mock_dataloader_callable,
+                mock_parallel_state_util,
+                30,
+                mock_is_data_loading_rank,
+                mock_create_model_parallel_group_callable,
+                cached_len=0,
+            )
 
         # Verify the dataloader was created and length was set
         self.assertEqual(result, mock_cdl_instance)
-        mock_cdl_instance.set_length.assert_called_once_with(75)
+        self.assertEqual(mock_cdl_class.call_args.kwargs["step"], 20)
+        mock_cdl_instance.set_length.assert_called_once_with(80)
+        self.assertEqual(mock_cdl_instance.epoch_length, 100)
+        mock_dataloader_callable.assert_not_called()
         
-        # Verify tensor operations for length synchronization
-        mock_tensor.assert_called_once_with(0, dtype=torch.long, device='cuda')  # CDL doesn't initialize, so 0
-        mock_all_reduce.assert_called_once()
+        # The non-loading rank contributes zero to the sole length reduction.
+        mock_tensor.assert_called_once_with(0, dtype=torch.long, device='cuda')
+        mock_all_reduce.assert_called_once_with(
+            mock_length_tensor,
+            op=torch.distributed.ReduceOp.MAX,
+            group=mock_tp_group,
+        )
 
     @patch("hyperpod_checkpointless_training.dataloader.config.get_num_microbatches")
     @patch("torch.distributed.all_reduce")
@@ -521,6 +548,9 @@ class TestRayCPUNodeConfig(unittest.TestCase):
         self.read_dl.__len__.return_value = 100
         self.fake_read_dataloader = types.ModuleType(RAY_READ_DATALOADER)
         self.fake_read_dataloader.RayReadDataLoader = Mock(return_value=self.read_dl)
+        self.fake_read_dataloader.RayReadDataLoader.remote_length_from_actor = Mock(
+            return_value=100
+        )
 
         fake_pkg = types.ModuleType(RAY_PKG)
         fake_pkg.__path__ = []
@@ -534,6 +564,13 @@ class TestRayCPUNodeConfig(unittest.TestCase):
         self.dataloader_init = Mock()
         self.is_data_loading_rank = Mock()
         self.create_model_parallel_group = Mock()
+
+        num_microbatches_patcher = patch(
+            "hyperpod_checkpointless_training.dataloader.config.get_num_microbatches",
+            return_value=1,
+        )
+        num_microbatches_patcher.start()
+        self.addCleanup(num_microbatches_patcher.stop)
 
         patchers = [
             patch.dict(
@@ -634,7 +671,7 @@ class TestRayCPUNodeConfig(unittest.TestCase):
             consumer_timeout_s=300.0,
         )
         self.fake_read_dataloader.RayReadDataLoader.assert_called_once_with(
-            100,
+            0,
             self.actor,
             consumer_id=11,
             prefetch_length=7,
@@ -642,7 +679,11 @@ class TestRayCPUNodeConfig(unittest.TestCase):
             enable_batch_encryption=False,
             register_timeout_s=900.0,
         )
-        self.read_dl.set_length.assert_called_once_with(0)
+        self.fake_read_dataloader.RayReadDataLoader.remote_length_from_actor.assert_called_once_with(
+            self.actor, 11, 900.0
+        )
+        self.read_dl.set_length.assert_called_once_with(100)
+        self.assertEqual(self.read_dl.epoch_length, 100)
         mock_all_reduce.assert_not_called()
         self.dataloader_init.assert_not_called()
         self.is_data_loading_rank.assert_not_called()
@@ -670,10 +711,35 @@ class TestRayCPUNodeConfig(unittest.TestCase):
             address="auto", namespace="hyperpod_checkpointless", ignore_reinit_error=True
         )
 
-    def test_create_unknown_remote_length_sets_zero(self):
-        self.read_dl.remote_length.return_value = None
-        self._create()
+    @patch(
+        "hyperpod_checkpointless_training.dataloader.config.get_num_microbatches",
+        return_value=4,
+    )
+    def test_create_unknown_remote_length_sets_zero(self, mock_num_mbs):
+        self.fake_read_dataloader.RayReadDataLoader.remote_length_from_actor.return_value = None
+        self._create(step=30)
+        mock_num_mbs.assert_called_once_with()
+        self.assertEqual(
+            self.fake_read_dataloader.RayReadDataLoader.call_args.args[0], 120
+        )
         self.read_dl.set_length.assert_called_once_with(0)
+        self.assertEqual(self.read_dl.epoch_length, 0)
+
+    @patch(
+        "hyperpod_checkpointless_training.dataloader.config.get_num_microbatches",
+        return_value=4,
+    )
+    def test_create_stateless_resume_scales_and_wraps(self, mock_num_mbs):
+        self.fake_read_dataloader.RayReadDataLoader.remote_length_from_actor.return_value = 100
+
+        self._create(step=30)
+        mock_num_mbs.assert_called_once_with()
+
+        self.assertEqual(
+            self.fake_read_dataloader.RayReadDataLoader.call_args.args[0], 20
+        )
+        self.read_dl.set_length.assert_called_once_with(80)
+        self.assertEqual(self.read_dl.epoch_length, 100)
 
     @patch("torch.distributed.all_reduce")
     def test_create_val(self, mock_all_reduce):

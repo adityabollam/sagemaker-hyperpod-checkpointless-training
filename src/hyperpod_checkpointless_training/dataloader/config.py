@@ -57,7 +57,11 @@ class MMAPConfig:
 
 @dataclass
 class CacheResumeMMAPConfig(MMAPConfig):
-    """Cache-resume MMAP Config."""
+    """Cache-resume MMAP Config.
+
+    The dataloader factory's ``len()`` must report the full epoch length regardless of
+    ``target_load_step``.
+    """
 
     cache_dir: str = "/dev/shm/pdl_cache"
     prefetch_length: int = 10
@@ -107,12 +111,39 @@ class CacheResumeMMAPConfig(MMAPConfig):
         force_cold_start = True if is_val else False
         prefetch_length = self.val_prefetch_length if is_val else self.prefetch_length
         synchronized_length = 0
+        stateless_resume = not is_val and not cached_len and step > 0
+        epoch_length = None
+        remaining_length = None
+        data_loading_rank = None
 
         if cached_len:
+            epoch_length = cached_len
+        elif stateless_resume:
+            data_loading_rank = is_data_loading_rank()
+            local_length = (
+                len(dataloader_init_callable(target_load_step=0))
+                if data_loading_rank
+                else 0
+            )
+            length_tensor = torch.tensor(local_length, dtype=torch.long, device="cuda")
+            tp_group = parallel_state_util.parallel_state.get_tensor_model_parallel_group()
+            dist.all_reduce(length_tensor, op=dist.ReduceOp.MAX, group=tp_group)
+            epoch_length = length_tensor.item()
+            if epoch_length > 0:
+                remaining_length, step = self._adjust_for_epoch_resume(
+                    epoch_length, step
+                )
+            else:
+                remaining_length = 0
+
+        if cached_len and not is_val:
             cached_len, step = self._adjust_for_epoch_resume(cached_len, step)
 
         # Create the appropriate dataloader based on parallel state
-        if is_data_loading_rank():
+        if data_loading_rank is None:
+            data_loading_rank = is_data_loading_rank()
+
+        if data_loading_rank:
             data_loader = CacheResumePrefetchedDataLoader(
                 step=step,
                 dataloader_init_callable=dataloader_init_callable,
@@ -127,7 +158,8 @@ class CacheResumeMMAPConfig(MMAPConfig):
             )
             if not cached_len:
                 data_loader.initialize_data_loader()
-                synchronized_length = len(data_loader.data_loader)
+                if not stateless_resume:
+                    synchronized_length = len(data_loader.data_loader)
 
         else:
             data_loader = CacheResumeReadDataLoader(
@@ -141,14 +173,22 @@ class CacheResumeMMAPConfig(MMAPConfig):
                 enable_batch_encryption=self.enable_batch_encryption,
             )
 
-        if not cached_len:
+        if not cached_len and not stateless_resume:
             length_tensor = torch.tensor(synchronized_length, dtype=torch.long, device='cuda')
             tp_group = parallel_state_util.parallel_state.get_tensor_model_parallel_group()
             dist.all_reduce(length_tensor, op=dist.ReduceOp.MAX, group=tp_group)
             synchronized_length = length_tensor.item()
     
         # Set data_loader length
-        data_loader.set_length(max(cached_len, synchronized_length))
+        if stateless_resume:
+            length = remaining_length
+        else:
+            length = max(cached_len, synchronized_length)
+        data_loader.set_length(length)
+        if not is_val:
+            data_loader.epoch_length = (
+                epoch_length if epoch_length is not None else length
+            )
 
         logger.info(
             debug_msg(f"Created {name} {data_loader.__class__.__name__} with length: {len(data_loader)}")
@@ -163,6 +203,9 @@ class RayCPUNodeConfig(MMAPConfig):
     Batches are produced by one detached Ray ``PrefetchActor`` per (job, split, dp_rank) running
     on a dedicated CPU node, and every GPU rank reads them through a ``RayReadDataLoader``.
     See docs/ray_cpu_dataloader.md.
+
+    For stateless train resumes, the factory's ``len()`` must report the full epoch length
+    regardless of ``target_load_step``.
     """
 
     cpu_dataloader_factory: Callable = None
@@ -235,9 +278,6 @@ class RayCPUNodeConfig(MMAPConfig):
         step = 0 if is_val else step
         prefetch_length = self.val_prefetch_length if is_val else self.prefetch_length
 
-        if cached_len and not is_val:
-            cached_len, step = self._adjust_for_epoch_resume(cached_len, step)
-
         parallel_state = parallel_state_util.parallel_state
         dp_rank = parallel_state.get_data_parallel_rank()
         dp_size = parallel_state.get_data_parallel_world_size()
@@ -257,10 +297,28 @@ class RayCPUNodeConfig(MMAPConfig):
             consumer_timeout_s=self.consumer_timeout_s,
         )
 
+        stateless_resume = not is_val and not cached_len and step > 0
+        epoch_length = None
+        if cached_len and not is_val:
+            epoch_length = cached_len
+            length, step = self._adjust_for_epoch_resume(cached_len, step)
+
+        consumer_id = dist.get_rank()
+        if stateless_resume:
+            epoch_length = RayReadDataLoader.remote_length_from_actor(
+                actor, consumer_id, self.register_timeout_s
+            )
+            if epoch_length:
+                length, step = self._adjust_for_epoch_resume(epoch_length, step)
+            else:
+                step *= get_num_microbatches()
+                length = 0
+                epoch_length = 0
+
         data_loader = RayReadDataLoader(
             step,
             actor,
-            consumer_id=dist.get_rank(),
+            consumer_id=consumer_id,
             prefetch_length=prefetch_length,
             is_val=is_val,
             enable_batch_encryption=self.enable_batch_encryption,
@@ -269,12 +327,14 @@ class RayCPUNodeConfig(MMAPConfig):
 
         if is_val:
             length = data_loader.remote_length() or cached_len
-        elif cached_len:
-            length = cached_len
-        else:
+        elif not cached_len and not stateless_resume:
             remote = data_loader.remote_length()
-            length = max(remote - step, 0) if remote is not None else 0
+            length = remote or 0
         data_loader.set_length(length)
+        if not is_val:
+            data_loader.epoch_length = (
+                epoch_length if epoch_length is not None else length
+            )
         if len(data_loader) == 0:
             logger.warning(
                 debug_msg(

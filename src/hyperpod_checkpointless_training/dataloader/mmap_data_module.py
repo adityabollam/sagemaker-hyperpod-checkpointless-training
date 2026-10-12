@@ -119,8 +119,10 @@ class MMAPDataModule(pl.LightningDataModule):
             is_val=False,
             cached_len=self.cached_train_dl_len
         )
-        # after resume, we may reduce the dataloader len, but we don't want to overwrite the original length
-        self.cached_train_dl_len = max(len(dataloader), self.cached_train_dl_len)
+        self.cached_train_dl_len = max(
+            getattr(dataloader, "epoch_length", None) or len(dataloader),
+            self.cached_train_dl_len,
+        )
         return dataloader
 
     # Implementing the val_data_loader with mmap config
