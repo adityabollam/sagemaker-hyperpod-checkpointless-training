@@ -642,7 +642,7 @@ class TestRayCPUNodeConfig(unittest.TestCase):
             enable_batch_encryption=False,
             register_timeout_s=900.0,
         )
-        self.read_dl.set_length.assert_called_once_with(100)
+        self.read_dl.set_length.assert_called_once_with(0)
         mock_all_reduce.assert_not_called()
         self.dataloader_init.assert_not_called()
         self.is_data_loading_rank.assert_not_called()

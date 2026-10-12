@@ -460,6 +460,16 @@ def test_tp_siblings_rollover_same_loader(length_harness):
     ]
 
 
+def test_fresh_nonzero_step_reports_remaining_and_rolls_over(length_harness):
+    harness = length_harness(n_items=12)
+    loader = harness.create(step=5)
+
+    assert len(loader) == 7
+    assert drain(loader) == list(range(5, 12))
+    assert drain(loader) == list(range(12))
+    assert len(loader) == 12
+
+
 def test_tp_siblings_rollover_via_new_create(length_harness):
     harness = length_harness()
     first_loaders = [

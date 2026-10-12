@@ -69,6 +69,7 @@ class StubPrefetchActor:
         self.registrations = []
         self.acks = []
         self.get_ref_consumer_ids = []
+        self.get_ref_generations = []
         self.registration_counter = 0
         self.consumer_registration_ids = {}
 
@@ -89,6 +90,7 @@ class StubPrefetchActor:
 
     def get_ref(self, step, consumer_id=None, generation=None):
         self.get_ref_consumer_ids.append(consumer_id)
+        self.get_ref_generations.append(generation)
         if self.get_ref_delay_s:
             time.sleep(self.get_ref_delay_s)
         if self.superseded_from is not None and step >= self.superseded_from:
@@ -125,6 +127,9 @@ class StubPrefetchActor:
 
     def get_ref_consumer_ids_seen(self):
         return self.get_ref_consumer_ids
+
+    def get_ref_generations_seen(self):
+        return self.get_ref_generations
 
 
 def _make(actor, step=0, **kwargs):
@@ -179,14 +184,14 @@ def test_final_stops_iteration_and_partial_consumption():
 def test_evicted_raises():
     actor = StubPrefetchActor.remote(evicted_below=10)
     dl = _make(actor, step=2)
-    with pytest.raises(RuntimeError, match="evicted"):
+    with pytest.raises(DataLoaderFatalError, match="evicted"):
         next(iter(dl))
 
 
 def test_superseded_generation_raises():
     actor = StubPrefetchActor.remote(superseded_from=0)
     dl = _make(actor)
-    with pytest.raises(RuntimeError, match="superseded"):
+    with pytest.raises(DataLoaderFatalError, match="superseded"):
         next(iter(dl))
 
 
@@ -282,12 +287,14 @@ def test_acks_reach_actor():
     assert acks, ray.get(actor.get_acks.remote())
 
 
-def test_get_ref_passes_consumer_id():
+def test_get_ref_passes_consumer_id_and_generation():
     actor = StubPrefetchActor.remote(final_step=3)
     dl = _make(actor, consumer_id=7)
     assert [b["step"] for b in dl] == [0, 1, 2]
     ids = ray.get(actor.get_ref_consumer_ids_seen.remote())
     assert ids and set(ids) == {7}
+    generations = ray.get(actor.get_ref_generations_seen.remote())
+    assert generations and set(generations) == {1}
 
 
 def test_len_semantics():

@@ -272,7 +272,8 @@ class RayCPUNodeConfig(MMAPConfig):
         elif cached_len:
             length = cached_len
         else:
-            length = data_loader.remote_length() or 0
+            remote = data_loader.remote_length()
+            length = max(remote - step, 0) if remote is not None else 0
         data_loader.set_length(length)
         if len(data_loader) == 0:
             logger.warning(

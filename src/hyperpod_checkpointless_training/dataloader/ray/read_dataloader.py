@@ -334,13 +334,13 @@ class RayReadDataLoader:
                     self._put(state, _FINAL)
                     return
                 elif status == "superseded":
-                    raise RuntimeError(
+                    raise dlu.DataLoaderFatalError(
                         f"[{self._consumer_id}] Prefetch actor generation {generation} "
                         "was superseded by another consumer's reseek before "
                         f"step {step} was read."
                     )
                 elif status == "evicted":
-                    raise RuntimeError(
+                    raise dlu.DataLoaderFatalError(
                         f"[{self._consumer_id}] Step {step} was evicted from the prefetch "
                         "actor window; it is older than the window's low watermark "
                         "(consider increasing lookback_length)."
