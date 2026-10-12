@@ -66,6 +66,7 @@ class StubPrefetchActor:
         self.polls = 0
         self.registrations = []
         self.acks = []
+        self.get_ref_consumer_ids = []
         self.registration_counter = 0
         self.consumer_registration_ids = {}
 
@@ -83,7 +84,8 @@ class StubPrefetchActor:
             "registration_id": registration_id,
         }
 
-    def get_ref(self, step):
+    def get_ref(self, step, consumer_id=None):
+        self.get_ref_consumer_ids.append(consumer_id)
         if self.get_ref_delay_s:
             time.sleep(self.get_ref_delay_s)
         if self.error_step is not None and step >= self.error_step:
@@ -115,6 +117,9 @@ class StubPrefetchActor:
 
     def get_polls(self):
         return self.polls
+
+    def get_ref_consumer_ids_seen(self):
+        return self.get_ref_consumer_ids
 
 
 def _make(actor, step=0, **kwargs):
@@ -263,6 +268,14 @@ def test_acks_reach_actor():
         lambda: ray.get(actor.get_acks.remote()) == [(3, 11, 1), (3, 12, 1), (3, 13, 1)]
     )
     assert acks, ray.get(actor.get_acks.remote())
+
+
+def test_get_ref_passes_consumer_id():
+    actor = StubPrefetchActor.remote(final_step=3)
+    dl = _make(actor, consumer_id=7)
+    assert [b["step"] for b in dl] == [0, 1, 2]
+    ids = ray.get(actor.get_ref_consumer_ids_seen.remote())
+    assert ids and set(ids) == {7}
 
 
 def test_len_semantics():

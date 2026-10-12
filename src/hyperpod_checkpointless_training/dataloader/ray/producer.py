@@ -16,6 +16,7 @@
 
 # Standard Library
 import threading
+import time
 import traceback
 from typing import Callable, Iterable
 
@@ -55,6 +56,8 @@ class PrefetchActor:
         is_val: bool = False,
         enable_batch_encryption: bool = False,
         poll_interval_s: float = 0.01,
+        consumer_timeout_s: float = 300.0,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self._dataloader_factory = dataloader_factory
         self._dp_rank = dp_rank
@@ -64,9 +67,16 @@ class PrefetchActor:
         self._is_val = is_val
         self._enable_batch_encryption = enable_batch_encryption
         self._poll_interval_s = poll_interval_s
+        self._consumer_timeout_s = consumer_timeout_s
+        self._clock = clock
 
         self._lock = threading.Lock()
-        self._window = BatchWindow(lookback_length, prefetch_length)
+        self._window = BatchWindow(
+            lookback_length,
+            prefetch_length,
+            consumer_timeout_s=consumer_timeout_s,
+            clock=clock,
+        )
         self._generation = 0
         self._iter = None
         self._length = None
@@ -100,11 +110,13 @@ class PrefetchActor:
                 reason = "reseek_token_changed"
 
             if reason is not None:
-                known_consumers = list(self._window.consumer_steps)
+                known_consumers = dict(self._window.last_seen)
                 dropped = self._window.reset(step)
                 del dropped
-                for known_consumer_id in known_consumers:
-                    self._window.register_consumer(known_consumer_id, step)
+                for known_consumer_id, seen in known_consumers.items():
+                    self._window.register_consumer(
+                        known_consumer_id, step, last_seen=seen
+                    )
                 self._generation += 1
                 self._error = None
                 self._last_reseek_token = reseek_token
@@ -173,8 +185,10 @@ class PrefetchActor:
             self._producer_thread_generation = generation
             self._producer_thread.start()
 
-    def get_ref(self, step: int) -> tuple[str, list]:
+    def get_ref(self, step: int, consumer_id: int | None = None) -> tuple[str, list]:
         with self._lock:
+            if consumer_id is not None:
+                self._window.touch(consumer_id)
             status, ref = self._window.lookup(step)
             if status == "ready":
                 return "ready", [ref]
@@ -242,7 +256,12 @@ class PrefetchActor:
                 self._generation += 1
                 self._iter = None
                 self._prebuilt = None
-                self._window = BatchWindow(self._lookback_length, self._prefetch_length)
+                self._window = BatchWindow(
+                    self._lookback_length,
+                    self._prefetch_length,
+                    consumer_timeout_s=self._consumer_timeout_s,
+                    clock=self._clock,
+                )
                 self._shutdown_complete = True
 
     def _get_encryption_manager(self):
@@ -340,6 +359,7 @@ def get_or_create_prefetch_actor(
     num_cpus: float = 1.0,
     resources: dict | None = None,
     enable_batch_encryption: bool = False,
+    consumer_timeout_s: float = 300.0,
 ):
     if resources is None:
         resources = {CPU_DATALOADER_RESOURCE: 0.001}
@@ -363,5 +383,6 @@ def get_or_create_prefetch_actor(
             prefetch_length=prefetch_length,
             is_val=split == "val",
             enable_batch_encryption=enable_batch_encryption,
+            consumer_timeout_s=consumer_timeout_s,
         )
     )
